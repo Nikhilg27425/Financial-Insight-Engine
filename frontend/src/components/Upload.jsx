@@ -3,53 +3,67 @@ import { useState } from "react";
 export default function Upload() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [text, setText] = useState("");
+  const [response, setResponse] = useState(null);
 
   const handleUpload = async () => {
-    if (!file) return alert("Please select a PDF file first");
+    if (!file) return alert("Please select a PDF file first!");
     setLoading(true);
+
     const formData = new FormData();
     formData.append("file", file);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/parse-file", {
+      // 👇 Correct backend endpoint (matches Keshav’s code)
+      const res = await fetch("http://127.0.0.1:8000/upload/", {
         method: "POST",
         body: formData,
       });
+
+      if (!res.ok) throw new Error(`Server error: ${res.status}`);
       const data = await res.json();
-      setText(data.text || "No text returned from backend");
+      setResponse(data);
     } catch (err) {
-      alert("Error fetching data. Check backend or network.");
       console.error(err);
+      alert("Upload failed. Check if backend is running and CORS is configured.");
     }
+
     setLoading(false);
   };
 
   return (
     <div style={{ padding: "2rem", textAlign: "center" }}>
       <h1>📄 Financial Document Analyzer</h1>
+
       <input
         type="file"
         accept="application/pdf"
         onChange={(e) => setFile(e.target.files[0])}
       />
-      <button onClick={handleUpload} style={{ marginLeft: "1rem" }}>
-        {loading ? "Uploading..." : "Upload & Analyze"}
+
+      <button
+        onClick={handleUpload}
+        disabled={loading}
+        style={{ marginLeft: "1rem" }}
+      >
+        {loading ? "Uploading..." : "Upload PDF"}
       </button>
-      <div style={{ marginTop: "2rem", textAlign: "left" }}>
-        <h3>Extracted Text:</h3>
-        <pre
-          style={{
-            background: "#f5f5f5",
-            padding: "1rem",
-            borderRadius: "8px",
-            maxHeight: "400px",
-            overflowY: "auto",
-          }}
-        >
-          {text}
-        </pre>
-      </div>
+
+      {response && (
+        <div style={{ marginTop: "2rem", textAlign: "left" }}>
+          <h3>✅ Upload Result:</h3>
+          <pre
+            style={{
+              background: "#f5f5f5",
+              padding: "1rem",
+              borderRadius: "8px",
+              maxHeight: "300px",
+              overflowY: "auto",
+            }}
+          >
+            {JSON.stringify(response, null, 2)}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

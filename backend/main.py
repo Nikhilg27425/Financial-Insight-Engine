@@ -17,7 +17,7 @@ app.add_middleware( #add only trusted host middleware (OWASP- prevent host heade
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://localhost:5173", "https://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"]
