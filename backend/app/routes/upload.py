@@ -41,9 +41,21 @@ async def upload_file(file: UploadFile=File(...)) -> Dict[str, str]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
     
+    try:
+        extracted_text = extract_text(str(file_path))
+    except HTTPException as e:
+        #forward handled HTTP errors (like unsupported format)
+        raise e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Text extraction failed: {type(e).__name__}"
+        )
+    
     #respond with metadata
     return {
         "message": "File uploaded successfully",
         "file_id": file_id,
         "stored_as": safe_filename,
+        "extracted_text": extracted_text[:10000]  # cap to prevent oversized responses
     }
