@@ -58,7 +58,7 @@ async def extract_text_endpoint(file_id: str):
             detail="File not found"
         )
     
-    #extract text
+    #extracting text
     try:
         extracted_text=extract_text(str(file_path))
     except HTTPException as e:
@@ -69,4 +69,4 @@ async def extract_text_endpoint(file_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Text extraction failed: {type(e).__name__}"
         )
-    return {"extracted_text": extracted_text}
+    return {"extracted_text": extracted_text[:5000]}
