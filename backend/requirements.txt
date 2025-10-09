@@ -1,3 +1,9 @@
 flask
 pandas
 numpy
+fastapi
+uvicorn
+python-multipart
+pdfplumber
+pytesseract
+pdf2image
