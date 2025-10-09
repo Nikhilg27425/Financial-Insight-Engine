@@ -47,26 +47,3 @@ async def upload_file(file: UploadFile=File(...)) -> Dict[str, str]:
         "file_id": file_id,
         "stored_as": safe_filename,
     }
-
-@router.post("/extract-text/{file_id}", response_class=JSONResponse)
-async def extract_text_endpoint(file_id: str):
-    #find the file in the uploads directory
-    file_path=next(UPLOAD_DIR.glob(f"{file_id}.*"), None)
-    if not file_path:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
-    
-    #extracting text
-    try:
-        extracted_text=extract_text(str(file_path))
-    except HTTPException as e:
-        #forward handled HTTP errors (like unsupported format)
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Text extraction failed: {type(e).__name__}"
-        )
-    return {"extracted_text": extracted_text[:5000]}

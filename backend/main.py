@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.routes import upload
+from app.routes import upload, analysis
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 app.include_router(upload.router, prefix="/upload", tags=["Upload"])
-#app.include_router(analysis.router, prefix="/analyze", tags=["Analysis"])
+app.include_router(analysis.router, prefix="/analyze", tags=["Analysis"])
 
 
 @app.get("/ping", tags=["Health"])
