@@ -26,13 +26,16 @@ export default function Upload() {
 
       // Step 2: If upload successful, call extraction endpoint with the file_id
       const fileId = uploadData.file_id;
-      const extractRes = await fetch(`http://127.0.0.1:8000/extract-text/${fileId}`, {
-        method: "POST",
+
+      // After upload, call the ANALYSIS endpoint
+      const analysisRes = await fetch(`http://127.0.0.1:8000/analyze/${fileId}`, {
+        method: "GET",
       });
       
-      const extractData = await extractRes.json();
+
+      const extractData = await analysisRes.json();
       
-      if (extractRes.ok) {
+      if (analysisRes.ok) {
         // Display the extracted text from the OCR process
         setResult(extractData.extracted_text || JSON.stringify(extractData, null, 2));
       } else {
