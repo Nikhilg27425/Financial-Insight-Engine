@@ -33,5 +33,7 @@ async def extract_text_endpoint(file_id: str):
     #limit response size to avoid very large payloads
     return {
         "file_id": file_id,
-        "extracted_text": extracted_text[:10000]
+        "raw_text": extracted_text.get("raw_text", "")[:10000],
+        "cleaned_text": extracted_text.get("cleaned_text", "")[:10000],
+        "tables": extracted_text.get("tables", [])
     }

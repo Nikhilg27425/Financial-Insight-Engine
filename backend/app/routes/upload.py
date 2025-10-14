@@ -4,7 +4,7 @@ import os
 import uuid
 import shutil
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Any
 from app.services.ocr_service import extract_text
 
 router=APIRouter() #router object
@@ -12,15 +12,16 @@ router=APIRouter() #router object
 UPLOAD_DIR=Path("uploads") #creates a directory uploads where all the uploaded files are stored
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_EXTENSIONS={".pdf"}
+ALLOWED_EXTENSIONS={".pdf", ".xlsx", ".xls", ".jpg", ".jpeg", ".png"}
 
 #MAX_FILE_SIZE=20*1024*1024 #20 MB
 
 @router.post("/", response_class=JSONResponse, status_code=201)
-async def upload_file(file: UploadFile=File(...)) -> Dict[str, str]:
+async def upload_file(file: UploadFile=File(...)) -> Dict[str, Any]:
     """
     Secure file upload endpoint.
-    Accepts only PDFs and stores them in a controlled directory.
+    Accepts files and stores them in a controlled directory.
+    Performs OCR extraction using extract_text.
     """
 
     file_ext=Path(file.filename).suffix.lower()
@@ -32,17 +33,17 @@ async def upload_file(file: UploadFile=File(...)) -> Dict[str, str]:
     safe_filename=f"{file_id}{file_ext}"
     file_path=UPLOAD_DIR / safe_filename
 
-    contents=await file.read()
+    #contents=await file.read()
 
     #write to disk/ save the uploaded file
     try:
-        with open(file_path, "wb") as buffer:
-            buffer.write(contents)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
     
     try:
-        extracted_text = extract_text(str(file_path))
+        extracted_data=extract_text(str(file_path))
     except HTTPException as e:
         #forward handled HTTP errors (like unsupported format)
         raise e
@@ -57,5 +58,7 @@ async def upload_file(file: UploadFile=File(...)) -> Dict[str, str]:
         "message": "File uploaded successfully",
         "file_id": file_id,
         "stored_as": safe_filename,
-        "extracted_text": extracted_text[:10000]  # cap to prevent oversized responses
+        "raw_text": extracted_data.get("raw_text", "")[:10000],
+        "cleaned_text": extracted_data.get("cleaned_text", "")[:10000],
+        "tables": extracted_data.get("tables", [])
     }

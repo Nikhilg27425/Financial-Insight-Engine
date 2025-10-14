@@ -7,3 +7,4 @@ python-multipart
 pdfplumber
 pytesseract
 pdf2image
+python-dotenv
