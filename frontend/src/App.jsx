@@ -1,11 +1,20 @@
 // App.jsx: This is your main application component. It's the root of your UI. Right now, it likely renders your Upload.jsx component. 
 // You'll modify this later to add navigation, routes, and other pages (like the dashboard).
-import Upload from "./components/Upload";
-function App() {
+import { Routes, Route, Navigate } from "react-router-dom";
+import Layout from "./components/Layout";
+import UploadPage from "./pages/UploadPage";
+import DashboardPage from "./pages/DashboardPage";
+import UploadedFilesPage from "./pages/UploadedFilesPage";
+
+export default function App() {
   return (
-    <div>
-      <Upload />
-    </div>
+    <Layout>
+      <Routes>
+        <Route path="/" element={<Navigate to="/upload" replace />} />
+        <Route path="/upload" element={<UploadPage />} />
+        <Route path="/dashboard" element={<DashboardPage />} />
+        <Route path="/files" element={<UploadedFilesPage />} />
+      </Routes>
+    </Layout>
   );
 }
-export default App;
