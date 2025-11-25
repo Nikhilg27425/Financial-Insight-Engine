@@ -9,3 +9,4 @@ pytesseract
 pdf2image
 python-dotenv
 httpx
+pdfminer.six

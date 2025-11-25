@@ -1,1063 +1,1442 @@
-# # parser_service.py
-# """
-# Robust parser improvements:
-# - normalize_number: resilient OCR numeric normalizer
-# - table postprocessing: prefer bottom totals, consolidated detection
-# - KPI computation using authoritative totals
-# - generic: works across company reports
-# """
-
 # import re
-# import math
-# from decimal import Decimal, InvalidOperation
-# from typing import Optional, List, Dict, Any, Tuple
+# from typing import List, Dict, Any, Optional
+# from app.services.preprocessing_service import parse_number_string_to_crore, scale_crore_to_rupees
+# from app.services.preprocessing_service import find_first_number_in_line
 
-# # ---- numeric normalizer ---------------------------------------------------
-# def normalize_number(raw: Optional[str]) -> Optional[float]:
+# def parse_financial_document(cleaned_text: str, tables: List[List[List[str]]], scale: float) -> Dict[str, Any]:
 #     """
-#     Turn an OCR/raw numeric-like string into a float value (crores or rupees as given).
-#     Returns None if it cannot be reliably parsed.
-
-#     Handles:
-#      - parentheses for negatives: "(123.45)" -> -123.45
-#      - repeated/misplaced dots like "1,31.4.80" -> 1314.80
-#      - common OCR confusions: l/I -> 1, O/o -> 0 (when safe)
-#      - thousands separators, stray chars, currency symbols
+#     Parse cleaned text and extracted tables to extract financial sections.
 #     """
-#     if raw is None:
-#         return None
-#     s = str(raw).strip()
-#     if s == '':
-#         return None
+#     balance_sheet: List[Dict[str, Any]] = []
+#     pnl: Dict[str, Dict[str, Any]] = {}
+#     cash_flow: Dict[str, Dict[str, Any]] = {}
 
-#     # Quick reject if obviously not numeric and not containing digits
-#     if not re.search(r'\d', s):
-#         return None
+#     # Helper functions
+#     def add_bs_item(name: str, current: Optional[int], previous: Optional[int] = None):
+#         item = {"item": name}
+#         if current is not None:
+#             item["current_period"] = current
+#         if previous is not None:
+#             item["previous_period"] = previous
+#         balance_sheet.append(item)
 
-#     # detect negative via parentheses or leading '-'
-#     neg = False
-#     if s.startswith('(') and s.endswith(')'):
-#         neg = True
-#         s = s[1:-1].strip()
-
-#     # fix common unicode dashes
-#     s = s.replace('\u2013', '-').replace('\u2014', '-').replace('\u2212', '-')
-
-#     # remove currency symbols and other common leading noise
-#     s = re.sub(r'[₹$£€]', '', s)
-
-#     # Replace comma thousands separators (we remove commas and then handle dots)
-#     # but keep them first for inspection. Remove spaces.
-#     s = s.replace(' ', '')
-
-#     # OCR fixes: 'O' or 'o' between digits likely 0; 'l'/'I' between digits likely 1
-#     s = re.sub(r'(?<=\d)[Oo](?=\d)', '0', s)
-#     s = re.sub(r'(?<=\d)[lI](?=\d)', '1', s)
-#     s = re.sub(r'(?<=\d)[lI](?=\D)', '1', s)
-#     s = re.sub(r'(?<=\D)[lI](?=\d)', '1', s)
-
-#     # Remove commas (thousands separators) - OCR sometimes places them correctly or incorrectly
-#     s = s.replace(',', '')
-
-#     # Collapse multiple dots into a sane format:
-#     # If more than 1 dot, convert by removing all dots and then placing last dot as decimal point
-#     if s.count('.') > 1:
-#         s_no_dot = s.replace('.', '')
-#         if len(s_no_dot) > 2:
-#             s = s_no_dot[:-2] + '.' + s_no_dot[-2:]
-#         else:
-#             s = s_no_dot
-
-#     # Keep only digits, a single dot, and an optional leading minus
-#     s = s.strip()
-#     leading_minus = ''
-#     if s.startswith('-'):
-#         leading_minus = '-'
-#         s = s[1:].lstrip()
-#     s = re.sub(r'[^0-9.]', '', s)
-#     if s.count('.') > 1:
-#         parts = s.split('.')
-#         s = parts[0] + '.' + ''.join(parts[1:])
-#     s = leading_minus + s
-
-#     if s in ['', '.', '-', '-.']:
-#         return None
-
-#     try:
-#         val = Decimal(s)
-#     except InvalidOperation:
-#         return None
-
-#     val_f = float(val)
-#     if neg:
-#         val_f = -val_f
-
-#     # sanity clamp: if value is absurdly large ( > 10 million crores ), reject
-#     if math.isfinite(val_f) and abs(val_f) > 1e7:
-#         return None
-
-#     return val_f
-
-# # ---- table utilities ------------------------------------------------------
-# def pick_numeric_from_cellblock(cell_raw: str) -> Optional[float]:
-#     """
-#     If a cell's raw text contains multiple numeric lines, prefer the last meaningful numeric
-#     (typical for totals placed at end). Returns normalized float or None.
-#     """
-#     if not cell_raw:
-#         return None
-#     lines = [ln.strip() for ln in cell_raw.splitlines() if ln.strip()]
-#     # prefer last line that contains digits
-#     for ln in reversed(lines):
-#         if re.search(r'\d', ln):
-#             n = normalize_number(ln)
-#             if n is not None:
-#                 return n
-#     # fallback: try to extract any numeric token in whole cell
-#     tokens = re.findall(r'[\d\.,\(\)-]+', cell_raw)
-#     for tok in reversed(tokens):
-#         n = normalize_number(tok)
-#         if n is not None:
-#             return n
-#     return None
-
-# def find_table_total_candidate(tables: List[Dict[str, Any]], label_patterns: List[str]) -> Optional[Tuple[float, str]]:
-#     """
-#     Search parsed tables for rows/cells that match any label pattern (e.g., 'total assets', 'total equity').
-#     Returns (value, matched_label) or None.
-#     """
-#     label_patterns_lower = [p.lower() for p in label_patterns]
-#     # scan tables and rows
-#     for table in tables:
-#         header = ' '.join(table.get('header', [])).lower() if table.get('header') else ''
-#         for row in table.get('rows', []):
-#             # each row is dict column->cell
-#             for col_key, cell in row.items():
-#                 cell_raw = ''
-#                 if isinstance(cell, dict):
-#                     cell_raw = cell.get('raw', '') or ''
-#                 else:
-#                     cell_raw = str(cell)
-#                 low = cell_raw.lower()
-#                 for pat in label_patterns_lower:
-#                     if pat in low or low.startswith(pat):
-#                         # candidate found; pick numeric
-#                         val = pick_numeric_from_cellblock(cell_raw)
-#                         if val is not None:
-#                             return (val, pat)
-#     return None
-
-# # ---- consolidated vs standalone detection --------------------------------
-# def detect_section_type(text: str) -> str:
-#     """
-#     Detect keywords in the nearby text to infer whether a table is 'consolidated' or 'standalone'
-#     Returns either "consolidated", "standalone", or "unknown"
-#     """
-#     txt = (text or '').lower()
-#     if 'consolidated' in txt:
-#         return 'consolidated'
-#     if 'standalone' in txt or 'stand alone' in txt:
-#         return 'standalone'
-#     return 'unknown'
-
-# # ---- KPI computation ------------------------------------------------------
-# def compute_kpis_from_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
-#     """
-#     Generic KPI computation that tries to find authoritative totals:
-#      - prefer consolidated balance sheet totals when available
-#      - fall back to standalone if consolidated not found
-#      - sanity-check assets ≈ equity + liabilities
-#     """
-#     out = {}
-#     # 1) try parsed_data.sections.balance_sheet for canonical entries
-#     bd = parsed.get('parsed_data', {}).get('sections', {}).get('balance_sheet', [])
-#     total_assets = None
-#     total_equity = None
-#     total_liabilities = None
-
-#     if isinstance(bd, list) and bd:
-#         for item in bd:
-#             if not isinstance(item, dict):
-#                 continue
-#             key = item.get('item', '').lower()
-#             val = item.get('current_period')
-#             if val is None:
-#                 # maybe it's 'value_crore' style
-#                 val = item.get('value_crore') or item.get('value')
-#             if key and val is not None:
-#                 if 'assets' in key and 'total' in key:
-#                     total_assets = float(val)
-#                 if 'equity' in key and 'total' in key:
-#                     total_equity = float(val)
-#                 if 'liabilities' in key and 'total' in key:
-#                     total_liabilities = float(val)
-
-#     # 2) fallback: search tables_parsed heuristically
-#     tables = parsed.get('parsed_data', {}).get('tables_parsed', []) or parsed.get('tables_parsed', [])
-#     if (not total_assets) and tables:
-#         cand = find_table_total_candidate(tables, ['total assets', 'total_assets', 'total assets (', 'total assets\n'])
-#         if cand:
-#             total_assets = cand[0]
-#     if (not total_equity) and tables:
-#         cand = find_table_total_candidate(tables, ['total equity', 'total_equity', 'total equity\n', 'total shareholders'])
-#         if cand:
-#             total_equity = cand[0]
-#     if (not total_liabilities) and tables:
-#         cand = find_table_total_candidate(tables, ['total liabilities', 'total_liabilities', 'total liabilities\n'])
-#         if cand:
-#             total_liabilities = cand[0]
-
-#     # 3) if still missing, try scanning entire raw_text for lines of "Total assets" and extract numeric
-#     raw_text = parsed.get('parsed_data', {}).get('raw_text') or parsed.get('raw_text') or parsed.get('text', '')
-#     if raw_text and (not total_assets or not total_equity or not total_liabilities):
-#         for line in raw_text.splitlines():
-#             low = line.lower()
-#             if not total_assets and 'total assets' in low:
-#                 n = pick_numeric_from_cellblock(line)
-#                 if n is not None:
-#                     total_assets = total_assets or n
-#             if not total_equity and ('total equity' in low or 'total equity and liabilities' in low):
-#                 n = pick_numeric_from_cellblock(line)
-#                 if n is not None:
-#                     total_equity = total_equity or n
-#             if not total_liabilities and 'total liabilities' in low:
-#                 n = pick_numeric_from_cellblock(line)
-#                 if n is not None:
-#                     total_liabilities = total_liabilities or n
-
-#     # 4) final sanity attempt: if assets missing but we have equity+liabilities, compute assets
-#     if not total_assets and total_equity is not None and total_liabilities is not None:
-#         total_assets = total_equity + total_liabilities
-
-#     # 5) final sanity check: assets ≈ equity + liabilities; if mismatch, try to choose the consistent triple from table candidates
-#     def is_consistent(a, e, l, tol=0.005):
-#         if a is None or e is None or l is None:
-#             return False
-#         return abs(a - (e + l)) / max(1, a) <= tol
-
-#     if not is_consistent(total_assets, total_equity, total_liabilities):
-#         # try to choose best triple from tables: gather candidates and pick one with smallest error
-#         candidates = []
-#         # scan tables for numeric columns that look like totals (bottom-most numbers)
-#         if tables:
-#             # for each table, attempt to find numeric totals for assets/equity/liabilities
-#             for table in tables:
-#                 a = find_table_total_candidate([table], ['total assets', 'total_assets'])
-#                 e = find_table_total_candidate([table], ['total equity', 'total_equity'])
-#                 l = find_table_total_candidate([table], ['total liabilities', 'total_liabilities'])
-#                 if a and e and l:
-#                     candidates.append((a[0], e[0], l[0]))
-#         # pick candidate with smallest mismatch
-#         best = None
-#         best_err = None
-#         for (a,e,l) in candidates:
-#             err = abs(a - (e + l)) / max(1, a)
-#             if best is None or err < best_err:
-#                 best = (a,e,l)
-#                 best_err = err
-#         if best and best_err is not None and best_err < 0.05:  # accept if within 5%
-#             total_assets, total_equity, total_liabilities = best
-
-#     # 6) compute KPIs if we have at least assets and equity
-#     kpis = {}
-#     # convert to rupees: we assume the values are in crores if that's the scale from parsed data.
-#     # We do NOT implicitly multiply here; consumer of this function should know units.
-#     if total_assets is not None:
-#         kpis['total_assets'] = float(total_assets)
-#     if total_equity is not None:
-#         kpis['total_equity'] = float(total_equity)
-#     if total_liabilities is not None:
-#         kpis['total_liabilities'] = float(total_liabilities)
-
-#     if total_equity and total_liabilities is not None:
-#         try:
-#             debt_to_equity = total_liabilities / total_equity if total_equity != 0 else None
-#             if debt_to_equity is not None:
-#                 kpis['debt_to_equity'] = round(debt_to_equity, 4)
-#         except Exception:
-#             pass
-
-#     if total_assets and total_equity:
-#         try:
-#             eq_pct = (total_equity / total_assets) * 100 if total_assets != 0 else None
-#             if eq_pct is not None:
-#                 kpis['equity_to_assets_pct'] = round(eq_pct, 2)
-#         except Exception:
-#             pass
-
-#     # revenue extraction (try parsed_data -> pnl -> revenue -> value_crore)
-#     revenue = None
-#     pnl = parsed.get('parsed_data', {}).get('sections', {}).get('pnl', {})
-#     if isinstance(pnl, dict):
-#         r = pnl.get('revenue') or pnl.get('total_revenue') or {}
-#         if isinstance(r, dict):
-#             revenue = r.get('value_crore') or r.get('value') or r.get('numeric_crore') or None
-#     # fallback search raw_text for "Total revenue" lines
-#     if not revenue and raw_text:
-#         for line in raw_text.splitlines():
-#             if 'total revenue' in line.lower() or 'total revenue from operations' in line.lower():
-#                 v = pick_numeric_from_cellblock(line)
-#                 if v is not None:
-#                     revenue = v
-#                     break
-
-#     if revenue is not None:
-#         kpis['revenue'] = float(revenue)
-
-#     # asset turnover = revenue / assets
-#     if revenue is not None and total_assets is not None and total_assets != 0:
-#         kpis['asset_turnover_ratio'] = round(float(revenue) / float(total_assets), 4)
-
-#     # add a simple summary
-#     summ_parts = []
-#     if 'debt_to_equity' in kpis:
-#         summ_parts.append(f"Debt-to-Equity: {kpis['debt_to_equity']}")
-#     if 'asset_turnover_ratio' in kpis:
-#         summ_parts.append(f"Asset Turnover: {kpis['asset_turnover_ratio']}")
-#     if 'equity_to_assets_pct' in kpis:
-#         summ_parts.append(f"Equity/Assets: {kpis['equity_to_assets_pct']}%")
-#     if summ_parts:
-#         kpis['summary'] = '; '.join(summ_parts)
-
-#     return kpis
-
-# # ---- top-level helper ----------------------------------------------------
-# def postprocess_parsed_document(parsed_doc: Dict[str, Any]) -> Dict[str, Any]:
-#     """
-#     Given an initial raw parsed document (from OCR + table extraction),
-#     apply normalization & KPI computation and attach corrected fields.
-#     """
-#     # normalize numeric tokens inside tables_parsed cells
-#     tables = parsed_doc.get('parsed_data', {}).get('tables_parsed', []) or parsed_doc.get('tables_parsed', [])
-#     if tables:
-#         for table in tables:
-#             rows = table.get('rows', [])
-#             for r_idx, row in enumerate(rows):
-#                 for col, cell in list(row.items()):
-#                     if isinstance(cell, dict):
-#                         raw = cell.get('raw')
-#                         norm = pick_numeric_from_cellblock(raw)
-#                         if norm is not None:
-#                             # store numeric normalized value explicitly
-#                             cell['numeric_crore'] = norm
-#                             cell['numeric_rupees'] = int(round(norm * 10000000))
-#                             row[col] = cell
-#                     else:
-#                         # keep as-is
-#                         pass
-#     # compute kpis
-#     kpis = compute_kpis_from_parsed(parsed_doc)
-#     # attach kpis under parsed_data.kpis
-#     parsed_doc.setdefault('parsed_data', {})
-#     parsed_doc['parsed_data'].setdefault('kpis', {})
-#     # move/overwrite with computed kpis
-#     parsed_doc['parsed_data']['kpis'].update(kpis)
-#     return parsed_doc
-
-
-import re
-from typing import List, Dict, Any, Optional
-from app.services.preprocessing_service import parse_number_string_to_crore, scale_crore_to_rupees
-from app.services.preprocessing_service import find_first_number_in_line
-
-def parse_financial_document(cleaned_text: str, tables: List[List[List[str]]], scale: float) -> Dict[str, Any]:
-    """
-    Parse cleaned text and extracted tables to extract financial sections.
-    """
-    balance_sheet: List[Dict[str, Any]] = []
-    pnl: Dict[str, Dict[str, Any]] = {}
-    cash_flow: Dict[str, Dict[str, Any]] = {}
-
-    # Helper functions
-    def add_bs_item(name: str, current: Optional[int], previous: Optional[int] = None):
-        item = {"item": name}
-        if current is not None:
-            item["current_period"] = current
-        if previous is not None:
-            item["previous_period"] = previous
-        balance_sheet.append(item)
-
-    def set_section_value(section: Dict[str, Any], key: str, val_crore: Optional[float], prev_crore: Optional[float] = None):
-        rupees = scale_crore_to_rupees(val_crore, scale) if val_crore is not None else None
-        prev_rupees = scale_crore_to_rupees(prev_crore, scale) if prev_crore is not None else None
-        section[key] = {"value_crore": val_crore, "value_rupees": rupees}
-        if prev_rupees is not None:
-            section[key]["previous_value_rupees"] = prev_rupees
-
-    # Parse lines from text
-    lines = [ln for ln in cleaned_text.splitlines() if ln.strip()]
-    for line in lines:
-        low = line.lower()
-        # Balance Sheet lines
-        if "total assets" in low and "current assets" not in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                balance_sheet.append({"item": "Total Assets", "current_period": rupees})
-        if "total equity" in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                balance_sheet.append({"item": "Total Equity", "current_period": rupees})
-        if "total liabilities" in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                balance_sheet.append({"item": "Total Liabilities", "current_period": rupees})
-        if "current assets" in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                balance_sheet.append({"item": "Current Assets", "current_period": rupees})
-        if "current liabilities" in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                balance_sheet.append({"item": "Current Liabilities", "current_period": rupees})
-        # P&L lines
-        if ("total income" in low or "total revenue" in low or "revenue from operations" in low) and "profit" not in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                pnl["revenue"] = {"value_crore": val, "value_rupees": rupees}
-        if ("net profit" in low or "profit after tax" in low or "profit for the year" in low or "profit for the period" in low):
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                pnl["net_profit"] = {"value_crore": val, "value_rupees": rupees}
-        # Cash Flow lines
-        if "net cash from operating" in low or "net cash generated from operating" in low or "cash generated from operations" in low:
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                cash_flow["operating_cf"] = {"value_crore": val, "value_rupees": rupees}
-        if ("purchase of fixed" in low or "payment for property" in low or "capital expenditure" in low or "capex" in low):
-            val = find_first_number_in_line(line)
-            if val is not None:
-                rupees = scale_crore_to_rupees(val, scale)
-                cash_flow["capex"] = {"value_crore": val, "value_rupees": rupees}
-
-    # Parse tables for multi-period data (if any)
-    for table in tables:
-        if len(table) < 2:
-            continue
-        header = table[0]
-        # Identify numeric columns by year in header
-        numeric_cols = [i for i, cell in enumerate(header) if isinstance(cell, str) and re.search(r"\d{4}", cell)]
-        if len(numeric_cols) >= 2:
-            cur_idx, prev_idx = numeric_cols[0], numeric_cols[1]
-        else:
-            # fallback: assume first column is labels, next two are numbers
-            if len(header) >= 3 and header[1] and header[2] and all(re.match(r"^[\d,\.\-]+$", str(x).replace(',', '')) for x in header[1:3]):
-                cur_idx, prev_idx = 1, 2
-            else:
-                continue
-        for row in table[1:]:
-            if not row or len(row) <= max(cur_idx, prev_idx):
-                continue
-            label = str(row[0]).strip()
-            label_norm = label.lower()
-            cur_val = parse_number_string_to_crore(str(row[cur_idx])) if row[cur_idx] not in (None, "") else None
-            prev_val = parse_number_string_to_crore(str(row[prev_idx])) if row[prev_idx] not in (None, "") else None
-            cur_rupees = scale_crore_to_rupees(cur_val, scale) if cur_val is not None else None
-            prev_rupees = scale_crore_to_rupees(prev_val, scale) if prev_val is not None else None
-            # Balance Sheet items
-            if "total assets" in label_norm:
-                balance_sheet = [item for item in balance_sheet if item.get("item") != "Total Assets"]
-                add_bs_item("Total Assets", cur_rupees, prev_rupees)
-            elif "total equity" in label_norm or "shareholders funds" in label_norm or "equity and liabilities" in label_norm:
-                balance_sheet = [item for item in balance_sheet if item.get("item") != "Total Equity"]
-                add_bs_item("Total Equity", cur_rupees, prev_rupees)
-            elif "total liabilities" in label_norm:
-                balance_sheet = [item for item in balance_sheet if item.get("item") != "Total Liabilities"]
-                add_bs_item("Total Liabilities", cur_rupees, prev_rupees)
-            elif "current assets" in label_norm:
-                balance_sheet = [item for item in balance_sheet if item.get("item") != "Current Assets"]
-                add_bs_item("Current Assets", cur_rupees, prev_rupees)
-            elif "current liabilities" in label_norm:
-                balance_sheet = [item for item in balance_sheet if item.get("item") != "Current Liabilities"]
-                add_bs_item("Current Liabilities", cur_rupees, prev_rupees)
-            # P&L items
-            elif "total income" in label_norm or "total revenue" in label_norm or "revenue from operations" in label_norm or "sales" in label_norm:
-                set_section_value(pnl, "revenue", cur_val, prev_val)
-            elif ("net profit" in label_norm or "profit after tax" in label_norm or "profit for the year" in label_norm) and "gross profit" not in label_norm:
-                set_section_value(pnl, "net_profit", cur_val, prev_val)
-            # Cash Flow items
-            elif "net cash from operating" in label_norm or "net cash generated from operating" in label_norm:
-                set_section_value(cash_flow, "operating_cf", cur_val, prev_val)
-            elif "capital expenditure" in label_norm or "purchase of fixed assets" in label_norm or "capex" in label_norm:
-                set_section_value(cash_flow, "capex", cur_val, prev_val)
-
-    # Remove duplicate balance sheet items, keeping last entries
-    unique = {}
-    for item in balance_sheet:
-        unique[item["item"]] = item
-    balance_sheet = list(unique.values())
-
-    return {"sections": {"balance_sheet": balance_sheet, "pnl": pnl, "cash_flow": cash_flow}, "scale": scale, "raw_text": cleaned_text}
-
-
-
-# """
-# parser_service.py
-
-# Responsibilities:
-# - Accept cleaned_text (string) and tables (list of extracted tables)
-# - Parse common financial statements pieces:
-#     * Balance sheet totals (total assets, total equity, total liabilities)
-#     * Income statement totals (revenue / total income, net profit / profit for period, profit attributable)
-#     * Cash flow items (operating cash flow, capex)
-#     * Basic items: cash & cash equivalents, current assets, current liabilities
-# - Use fuzzy matching for label variants (several synonyms)
-# - Return parsed_data with numeric values BOTH as 'crore' and 'rupees' (scaled)
-# - Provide sections dict and tables_parsed
-# """
-
-# import re
-# from typing import Dict, Any, List, Tuple, Optional
-# from app.services.preprocessing_service import (
-#     detect_scale_from_text,
-#     parse_number_string_to_crore,
-#     scale_crore_to_rupees,
-#     find_first_number_in_line,
-# )
-
-# # fuzzy label variants for key items
-# LABEL_PATTERNS = {
-#     "total_assets": [
-#         r"total assets\b",
-#         r"assets\s+total\b",
-#         r"total\s+asset\s+and\s+liabilities\b",
-#         r"total\s+assets\s+and\s+liabilities\b",
-#     ],
-#     "total_equity": [r"total equity\b", r"total shareholders' equity\b", r"total shareholders equity\b"],
-#     "total_liabilities": [r"total liabilities\b"],
-#     "revenue": [r"total income\b", r"total revenue\b", r"revenue from operations\b", r"total revenue from operations\b"],
-#     "net_profit": [r"profit for the period\b", r"profit for the period attributable\b", r"profit for the period.*\b", r"profit after tax\b", r"net profit\b", r"profit for the year\b"],
-#     "profit_attrib": [r"profit attributable to shareholders of the company\b", r"profit attributable to shareholders\b"],
-#     "cash_and_cash_equivalents": [r"cash and cash equivalents\b", r"cash & cash equivalents\b", r"cash and cash equivalents \(.*\)\b"],
-#     "current_assets": [r"total current assets\b", r"current assets\b"],
-#     "current_liabilities": [r"total current liabilities\b", r"current liabilities\b"],
-#     "operating_cf": [r"net cash generated from operating activities\b", r"net cash generated from operating activities\b", r"net cash inflow from operating activities\b"],
-#     "capex": [r"purchase of property, plant and equipment\b", r"payment for purchase of property, plant and equipment\b", r"payment for purchase of property plant and equipment\b"],
-#     "eps": [r"earnings per share\b", r"basic earnings per share\b", r"eps\b"],
-# }
-
-# # normalize regex
-# LABEL_PATTERNS = {k: [re.compile(pat, re.IGNORECASE) for pat in pats] for k, pats in LABEL_PATTERNS.items()}
-
-
-# def _match_label_in_text(text: str, patterns: List[re.Pattern]) -> Optional[Tuple[str, int]]:
-#     """
-#     Search the text for a line that contains any of the compiled patterns.
-#     Returns (line, index) of the first match or None.
-#     """
-#     lines = text.splitlines()
-#     for i, ln in enumerate(lines):
-#         for pat in patterns:
-#             if pat.search(ln):
-#                 return ln, i
-#     return None
-
-
-# def _search_nearby_number(lines: List[str], idx: int, window: int = 3) -> Optional[float]:
-#     """
-#     Once we find a label at lines[idx], look in the same line and +/- window lines for the first numeric token.
-#     Return numeric value (as shown in report unit, e.g., '149748') or None.
-#     """
-#     # check same line first
-#     for offset in range(0, window + 1):
-#         for sign in (1, -1):
-#             line_index = idx + sign * offset if offset != 0 else idx
-#             if line_index < 0 or line_index >= len(lines):
-#                 continue
-#             num = find_first_number_in_line(lines[line_index])
-#             if num is not None:
-#                 return num
-#     return None
-
-
-# def _extract_from_tables(tables: List[List[List[str]]], header_tokens: List[str]) -> Optional[float]:
-#     """
-#     Try to find a value in tables heuristically.
-#     tables is a list of tables; each table is list of rows; each row is list of cell text strings.
-#     header_tokens: list of lowercased substrings to match the label.
-#     """
-#     if not tables:
-#         return None
-#     for table in tables:
-#         for row in table:
-#             # join row cells to a string
-#             row_join = " ".join(cell for cell in row if cell)
-#             lower = row_join.lower()
-#             for tok in header_tokens:
-#                 if tok in lower:
-#                     # attempt to find numeric cells to the right of the label
-#                     # prefer last numeric cell in row
-#                     for cell in reversed(row):
-#                         if not cell:
-#                             continue
-#                         val = parse_number_string_to_crore(cell)
-#                         if val is not None:
-#                             return val
-#                     # fallback: any numeric in the row
-#                     for cell in row:
-#                         v = parse_number_string_to_crore(cell)
-#                         if v is not None:
-#                             return v
-#     return None
-
-
-# def _try_patterns_in_text(cleaned_text: str, key: str) -> Optional[float]:
-#     patterns = LABEL_PATTERNS.get(key, [])
-#     match = _match_label_in_text(cleaned_text, patterns)
-#     if match:
-#         line, idx = match
-#         # search near the label for numbers
-#         lines = cleaned_text.splitlines()
-#         num = _search_nearby_number(lines, idx, window=4)
-#         if num is not None:
-#             return num
-#     return None
-
-
-# def parse_financial_document(cleaned_text: str, tables: List[List[List[str]]]) -> Dict[str, Any]:
-#     """
-#     Main parsing entrypoint used by routes.
-#     cleaned_text: full cleaned text string returned from OCR flow
-#     tables: list of tables (each table a list of row lists)
-#     Returns parsed_data dict with:
-#       - sections: {balance_sheet: [...], pnl: {...}, cash_flow: {...}}
-#       - tables_parsed: list...
-#       - scale: detected scale (float)
-#       - raw_text: original cleaned_text (for auditing, truncated by caller)
-#     """
-#     # detect scale
-#     scale = detect_scale_from_text(cleaned_text)
-
-#     result = {
-#         "sections": {
-#             "balance_sheet": [],
-#             "pnl": {},
-#             "cash_flow": {},
-#         },
-#         "tables_parsed": [],
-#         "scale": scale,
-#         "raw_text": cleaned_text,
-#     }
-
-#     # helper to set values both as crore and rupees
-#     def set_value(section: Dict, name: str, val_crore: Optional[float], source: str = "text"):
+#     def set_section_value(section: Dict[str, Any], key: str, val_crore: Optional[float], prev_crore: Optional[float] = None):
 #         rupees = scale_crore_to_rupees(val_crore, scale) if val_crore is not None else None
-#         section[name] = {"value_crore": val_crore, "value_rupees": rupees, "source": source}
+#         prev_rupees = scale_crore_to_rupees(prev_crore, scale) if prev_crore is not None else None
+#         section[key] = {"value_crore": val_crore, "value_rupees": rupees}
+#         if prev_rupees is not None:
+#             section[key]["previous_value_rupees"] = prev_rupees
 
-#     # 1) Try common keys from text (label matching)
-#     keys = [
-#         ("total_assets", "balance_sheet"),
-#         ("total_equity", "balance_sheet"),
-#         ("total_liabilities", "balance_sheet"),
-#         ("current_assets", "balance_sheet"),
-#         ("current_liabilities", "balance_sheet"),
-#         ("revenue", "pnl"),
-#         ("net_profit", "pnl"),
-#         ("profit_attrib", "pnl"),
-#         ("cash_and_cash_equivalents", "balance_sheet"),
-#         ("operating_cf", "cash_flow"),
-#         ("capex", "cash_flow"),
-#     ]
+#     # Parse lines from text
+#     lines = [ln for ln in cleaned_text.splitlines() if ln.strip()]
+#     for line in lines:
+#         low = line.lower()
+#         # Balance Sheet lines
+#         if "total assets" in low and "current assets" not in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 balance_sheet.append({"item": "Total Assets", "current_period": rupees})
+#         if "total equity" in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 balance_sheet.append({"item": "Total Equity", "current_period": rupees})
+#         if "total liabilities" in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 balance_sheet.append({"item": "Total Liabilities", "current_period": rupees})
+#         if "current assets" in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 balance_sheet.append({"item": "Current Assets", "current_period": rupees})
+#         if "current liabilities" in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 balance_sheet.append({"item": "Current Liabilities", "current_period": rupees})
+#         # P&L lines
+#         if ("total income" in low or "total revenue" in low or "revenue from operations" in low) and "profit" not in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 pnl["revenue"] = {"value_crore": val, "value_rupees": rupees}
+#         if ("net profit" in low or "profit after tax" in low or "profit for the year" in low or "profit for the period" in low):
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 pnl["net_profit"] = {"value_crore": val, "value_rupees": rupees}
+#         # Cash Flow lines
+#         if "net cash from operating" in low or "net cash generated from operating" in low or "cash generated from operations" in low:
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 cash_flow["operating_cf"] = {"value_crore": val, "value_rupees": rupees}
+#         if ("purchase of fixed" in low or "payment for property" in low or "capital expenditure" in low or "capex" in low):
+#             val = find_first_number_in_line(line)
+#             if val is not None:
+#                 rupees = scale_crore_to_rupees(val, scale)
+#                 cash_flow["capex"] = {"value_crore": val, "value_rupees": rupees}
 
-#     # iterate keys and use heuristics
-#     for k, section_name in keys:
-#         val = _try_patterns_in_text(cleaned_text, k)
-#         if val is None:
-#             # try from tables with simple tokens (take first word of pattern)
-#             token_guesses = [pat.pattern.split(r"\b")[0].strip().strip("\\") for pat in LABEL_PATTERNS.get(k, [])]
-#             # also use direct friendly tokens
-#             friendly = {
-#                 "total_assets": ["total assets", "total assets  ", "total"],
-#                 "total_equity": ["total equity", "total shareholders"],
-#                 "total_liabilities": ["total liabilities"],
-#                 "revenue": ["total income", "revenue from operations", "total revenue"],
-#                 "net_profit": ["profit for the period", "profit for the year", "net profit", "profit after tax"],
-#                 "profit_attrib": ["profit attributable to shareholders", "attributable to shareholders"],
-#                 "cash_and_cash_equivalents": ["cash and cash equivalents", "cash & cash equivalents"],
-#                 "current_assets": ["total current assets", "current assets"],
-#                 "current_liabilities": ["total current liabilities", "current liabilities"],
-#                 "operating_cf": ["net cash generated from operating activities", "net cash generated from operating"],
-#                 "capex": ["payment for purchase of property, plant and equipment", "purchase of property plant and equipment"],
-#             }.get(k, [])
-#             token_list = token_guesses + friendly
-#             val = _extract_from_tables(tables, token_list)
-#             if val is None:
-#                 # final attempt: generic search in whole text for the first numeric near a line with label words
-#                 for token in token_list:
-#                     if not token:
-#                         continue
-#                     idx = cleaned_text.lower().find(token)
-#                     if idx != -1:
-#                         # take a slice and find first number in that slice
-#                         snippet = cleaned_text[max(0, idx - 200): idx + 200]
-#                         val_snip = find_first_number_in_line(snippet)
-#                         if val_snip is not None:
-#                             val = val_snip
-#                             break
-
-#         set_value(result["sections"][section_name], k, val, source=("text" if val is not None else "none"))
-
-#     # 2) Parse tables and return a normalized simple structure in tables_parsed
+#     # Parse tables for multi-period data (if any)
 #     for table in tables:
-#         if not table:
+#         if len(table) < 2:
 #             continue
-#         # header normalization: make header tokens lowercase, underscore separated
-#         header_row = table[0] if table and len(table) > 0 else []
-#         header_norm = []
-#         for h in header_row:
-#             if not isinstance(h, str):
-#                 header_norm.append("")
+#         header = table[0]
+#         # Identify numeric columns by year in header
+#         numeric_cols = [i for i, cell in enumerate(header) if isinstance(cell, str) and re.search(r"\d{4}", cell)]
+#         if len(numeric_cols) >= 2:
+#             cur_idx, prev_idx = numeric_cols[0], numeric_cols[1]
+#         else:
+#             # fallback: assume first column is labels, next two are numbers
+#             if len(header) >= 3 and header[1] and header[2] and all(re.match(r"^[\d,\.\-]+$", str(x).replace(',', '')) for x in header[1:3]):
+#                 cur_idx, prev_idx = 1, 2
+#             else:
 #                 continue
-#             h2 = re.sub(r"[^0-9a-zA-Z]+", "_", h.strip().lower()).strip("_")
-#             header_norm.append(h2)
-#         rows_parsed = []
 #         for row in table[1:]:
-#             cellmap = {}
-#             for i, cell in enumerate(row):
-#                 key = header_norm[i] if i < len(header_norm) else f"c{i}"
-#                 # parse numeric if possible
-#                 num = parse_number_string_to_crore(cell) if isinstance(cell, str) else None
-#                 cellmap[key] = {"raw": cell, "numeric_crore": num, "numeric_rupees": scale_crore_to_rupees(num, scale) if num is not None else None}
-#             rows_parsed.append(cellmap)
-#         result["tables_parsed"].append({"header": header_norm, "rows": rows_parsed})
+#             if not row or len(row) <= max(cur_idx, prev_idx):
+#                 continue
+#             label = str(row[0]).strip()
+#             label_norm = label.lower()
+#             cur_val = parse_number_string_to_crore(str(row[cur_idx])) if row[cur_idx] not in (None, "") else None
+#             prev_val = parse_number_string_to_crore(str(row[prev_idx])) if row[prev_idx] not in (None, "") else None
+#             cur_rupees = scale_crore_to_rupees(cur_val, scale) if cur_val is not None else None
+#             prev_rupees = scale_crore_to_rupees(prev_val, scale) if prev_val is not None else None
+#             # Balance Sheet items
+#             if "total assets" in label_norm:
+#                 balance_sheet = [item for item in balance_sheet if item.get("item") != "Total Assets"]
+#                 add_bs_item("Total Assets", cur_rupees, prev_rupees)
+#             elif "total equity" in label_norm or "shareholders funds" in label_norm or "equity and liabilities" in label_norm:
+#                 balance_sheet = [item for item in balance_sheet if item.get("item") != "Total Equity"]
+#                 add_bs_item("Total Equity", cur_rupees, prev_rupees)
+#             elif "total liabilities" in label_norm:
+#                 balance_sheet = [item for item in balance_sheet if item.get("item") != "Total Liabilities"]
+#                 add_bs_item("Total Liabilities", cur_rupees, prev_rupees)
+#             elif "current assets" in label_norm:
+#                 balance_sheet = [item for item in balance_sheet if item.get("item") != "Current Assets"]
+#                 add_bs_item("Current Assets", cur_rupees, prev_rupees)
+#             elif "current liabilities" in label_norm:
+#                 balance_sheet = [item for item in balance_sheet if item.get("item") != "Current Liabilities"]
+#                 add_bs_item("Current Liabilities", cur_rupees, prev_rupees)
+#             # P&L items
+#             elif "total income" in label_norm or "total revenue" in label_norm or "revenue from operations" in label_norm or "sales" in label_norm:
+#                 set_section_value(pnl, "revenue", cur_val, prev_val)
+#             elif ("net profit" in label_norm or "profit after tax" in label_norm or "profit for the year" in label_norm) and "gross profit" not in label_norm:
+#                 set_section_value(pnl, "net_profit", cur_val, prev_val)
+#             # Cash Flow items
+#             elif "net cash from operating" in label_norm or "net cash generated from operating" in label_norm:
+#                 set_section_value(cash_flow, "operating_cf", cur_val, prev_val)
+#             elif "capital expenditure" in label_norm or "purchase of fixed assets" in label_norm or "capex" in label_norm:
+#                 set_section_value(cash_flow, "capex", cur_val, prev_val)
 
-#     # 3) Provide small validation & warnings
-#     # If totals are wildly inconsistent (e.g., total_assets missing but current_assets present), warn later in calling code.
-#     # Add a simple sanity check: if total_assets exists and equity+liabilities missing, attempt to compute liabilities
-#     ta = result["sections"]["balance_sheet"].get("total_assets", {}).get("value_crore")
-#     te = result["sections"]["balance_sheet"].get("total_equity", {}).get("value_crore")
-#     cl = result["sections"]["balance_sheet"].get("current_liabilities", {}).get("value_crore")
-#     ca = result["sections"]["balance_sheet"].get("current_assets", {}).get("value_crore")
-#     # compute total_liabilities if missing
-#     if ta is not None and te is not None and result["sections"]["balance_sheet"].get("total_liabilities", {}).get("value_crore") in (None,):
-#         computed_liab = ta - te
-#         set_value(result["sections"]["balance_sheet"], "total_liabilities", computed_liab, source="computed")
-#         result.setdefault("_notes", []).append("total_liabilities computed as total_assets - total_equity")
-#     # populate simple parsed_data top-level for backward compatibility
-#     parsed_data = {
-#         "sections": result["sections"],
-#         "tables_parsed": result["tables_parsed"],
-#         "scale": result["scale"],
-#         "raw_text": result["raw_text"],
-#     }
-#     return parsed_data
+#     # Remove duplicate balance sheet items, keeping last entries
+#     unique = {}
+#     for item in balance_sheet:
+#         unique[item["item"]] = item
+#     balance_sheet = list(unique.values())
 
-
-# # """
-# # Parser service that converts cleaned_text + tables into structured financial JSON.
-
-# # ✅ Features:
-# # - Robust section detection (handles merged OCR text like 'profitandloss', 'cashflow', etc.)
-# # - Extracts key financial data (Balance Sheet, P&L, Cash Flow, Equity)
-# # - Fallback pattern-based extraction when tables fail
-# # - Clean normalization and data validation
-# # - Adheres to OWASP safe coding principles
-# # """
-
-# # import re
-# # import logging
-# # from typing import Dict, Any, List
-# # from fastapi import HTTPException, status
-# # from app.services.preprocessing_service import parse_number, detect_document_scale
-
-# # logger = logging.getLogger(__name__)
-
-# # # Core numeric token regex
-# # _NUM_TOKEN_RE = r'\(?[0-9][0-9,\.()]*\)?'
+#     return {"sections": {"balance_sheet": balance_sheet, "pnl": pnl, "cash_flow": cash_flow}, "scale": scale, "raw_text": cleaned_text}
 
 
-# # # -------------------------------------------------------------------------
-# # # SECTION SPLITTER — detects sections reliably even with OCR distortions
-# # # -------------------------------------------------------------------------
-# # def _split_into_sections(text: str) -> Dict[str, str]:
-# #     """
-# #     Splits financial document into sections based on key phrases,
-# #     regardless of OCR spacing or case.
-# #     This uses regex patterns that allow optional non-alphanumeric characters
-# #     between letters so merged headings (profitandloss, profit and loss, PROF IT & LOSS) are detected.
-# #     """
-# #     if not text:
-# #         return {}
-
-# #     section_terms = {
-# #         "balance_sheet": ["balance sheet", "statement of financial position", "balancesheet", "financialposition"],
-# #         "pnl": ["profit and loss", "statement of profit and loss", "statement of profit", "profitandloss", "statementofprofitandloss", "operations"],
-# #         "cash_flow": ["cash flow", "statement of cash flows", "cashflow", "statementofcashflows"],
-# #         "changes_in_equity": ["changes in equity", "statement of changes in equity", "changesinequity"],
-# #     }
-
-# #     positions: Dict[str, int] = {}
-
-# #     # For each term build a tolerant regex that allows non-alphanumeric between characters
-# #     def tolerant_pattern(term: str) -> str:
-# #         # split into words and join with a flexible separator
-# #         words = re.split(r'\s+', term.strip())
-# #         parts = []
-# #         for w in words:
-# #             # allow optional non-alnum between characters in a word
-# #             chars = [re.escape(c) + r'[^a-z0-9]*' for c in w.lower()]
-# #             parts.append(''.join(chars))
-# #         # allow any whitespace/non-word between words
-# #         return r'\b' + r'[^a-z0-9]*'.join(parts) + r'\b'
-
-# #     lower_text = text  # keep original (we'll search with regex)
-# #     for name, terms in section_terms.items():
-# #         for term in terms:
-# #             pat = tolerant_pattern(term)
-# #             m = re.search(pat, lower_text, flags=re.IGNORECASE)
-# #             if m:
-# #                 positions[name] = m.start()
-# #                 break
-
-# #     if not positions:
-# #         # fallback: whole text as balance_sheet block
-# #         return {"balance_sheet": text}
-
-# #     # sort detected positions and slice original text into blocks
-# #     sorted_items = sorted(positions.items(), key=lambda x: x[1])
-# #     sections: Dict[str, str] = {}
-# #     for i, (sec_name, start_idx) in enumerate(sorted_items):
-# #         end_idx = sorted_items[i + 1][1] if i + 1 < len(sorted_items) else len(text)
-# #         block = text[start_idx:end_idx].strip()
-# #         # only include reasonably sized blocks
-# #         if len(block) > 50:
-# #             sections[sec_name] = block
-# #     return sections
 
 
-# # # -------------------------------------------------------------------------
-# # # CORE PARSER LOGIC
-# # # -------------------------------------------------------------------------
-# # def parse_financial_document(cleaned_text: str, tables: List[List]) -> Dict[str, Any]:
-# #     if not cleaned_text:
-# #         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty cleaned_text")
 
-# #     scale, unit_label = detect_document_scale(cleaned_text)
-# #     sections = _split_into_sections(cleaned_text)
 
-# #     if not any([sections.get("balance_sheet"), sections.get("pnl")]):
-# #         # Detect company name early for proper metadata
-# #         meta_info = _extract_meta(cleaned_text, unit_label="units")
-# #         return {
-# #             "meta": meta_info,
-# #             "scale": 1.0,
-# #             "sections": {},
-# #             "tables": tables or [],
-# #             "kpis": {
-# #                 "summary": "No financial statements detected — likely a narrative, CSR, or management discussion section."
-# #             }
-# #         }
+
+
+
+# """
+# Parser orchestration: converts OCR outputs (pages_text + tables) into final JSON.
+
+# Strategy summary:
+# - For each table, attempt KPI extraction using table_extractor.extract_kpi_rows(...)
+# - Classify the table into balance_sheet / pnl / cash_flow using page text heuristics (keywords)
+# - Append extracted KPI rows to the matching section
+# - Provide flags for unclassified or suspicious tables
+
+# Usage:
+#     parser = ParserService(prefer_first_column_labels=True)
+#     result_dict = parser.parse(tables, pages_text)
+# """
+# import logging
+# from typing import List, Dict, Any
+# from app.services.table_extractor import extract_kpi_rows
+# from app.schemas.output_schema import ExtractionOutput
+
+# logger = logging.getLogger("app.services.parser_service")
+
+
+# class ParserServiceError(Exception):
+#     pass
+
+
+# class ParserService:
+#     def __init__(self, prefer_first_column_labels: bool = True):
+#         self.prefer_first_column = bool(prefer_first_column_labels)
     
-# #     parsed = {
-# #         "meta": _extract_meta(cleaned_text, unit_label),
-# #         "scale": scale,
-# #         "sections": {},
-# #         "tables": tables or [],
-# #     }
+#     def _compute_important_kpis(self, parsed):
+#         bs = parsed.get("balance_sheet", []) or []
+#         pnl = parsed.get("pnl", []) or []
+#         cf = parsed.get("cash_flow", []) or []
 
-# #     # Structured section parsing
-# #     parsed["sections"]["balance_sheet"] = _extract_table_like_section(sections.get("balance_sheet", ""), scale)
-# #     parsed["sections"]["pnl"] = _extract_simple_kv(sections.get("pnl", ""), scale)
-# #     parsed["sections"]["cash_flow"] = _extract_simple_kv(sections.get("cash_flow", ""), scale)
-# #     parsed["sections"]["changes_in_equity"] = _extract_simple_kv(sections.get("changes_in_equity", ""), scale)
+#         def normalize(s):
+#             if not s: return ""
+#             return (
+#                 s.lower()
+#                 .replace(" ", "")
+#                 .replace("\u00a0", "")
+#                 .replace("\u2009", "")
+#                 .replace(".", "")
+#                 .replace(":", "")
+#             )
 
-# #     # If P&L not detected, try a document-wide P&L extraction (fallback)
-# #     if not parsed["sections"]["pnl"]:
-# #         pnl_fb = _extract_pnl_from_text(cleaned_text, scale)
-# #         # merge fallback keys
-# #         if pnl_fb:
-# #             parsed["sections"]["pnl"].update(pnl_fb)
-
-# #     # Fallback extraction for missing or incomplete balance sheet
-# #     if not parsed["sections"]["balance_sheet"]:
-# #         fallback = _extract_from_text(cleaned_text)
-# #         for sec in ["balance_sheet", "pnl", "cash_flow"]:
-# #             parsed["sections"][sec] = parsed["sections"].get(sec) or fallback.get(sec, {})
-
-# #     # Validate basic balance (may raise)
-# #     try:
-# #         _validate_basic_balance(parsed)
-# #     except Exception as e:
-# #         # record validation warning instead of failing endpoint
-# #         parsed["validation_warning"] = str(e)
-
-# #     return parsed
+#         def get_val(row):
+#             for v in row.get("values", {}).values():
+#                 if isinstance(v, (int, float)):
+#                     return v
+#             return None
 
 
-# # # -------------------------------------------------------------------------
-# # # SECTION HELPERS
-# # # -------------------------------------------------------------------------
+#         def match_exact_label(rows, keywords):
+#             """Only match clean labels, and avoid matching 'total liabilities and equity'."""
+#             for row in rows:
+#                 lbl = normalize(row.get("label"))
+#                 if any(k == lbl for k in keywords):
+#                     return get_val(row)
+#             return None
 
-# # def _detect_period_hint(text: str) -> str:
-# #     """
-# #     Detect reporting period like 'As at June 30, 2024' → 'Q1 FY25'
-# #     """
-# #     match = re.search(r'(June|September|December|March)\s+\d{1,2},?\s*(20\d{2})', text)
-# #     if not match:
-# #         return None
+#         def match_contains(rows, keywords, exclude=None):
+#             """General contains search."""
+#             for row in reversed(rows):
+#                 lbl = normalize(row.get("label"))
+#                 if exclude:
+#                     if any(e in lbl for e in exclude):
+#                         continue
+#                 if any(k in lbl for k in keywords):
+#                     v = get_val(row)
+#                     if v is not None:
+#                         return v
+#             return None
 
-# #     month = match.group(1).lower()
-# #     year = int(match.group(2))
-# #     fy = f"FY{(year + 1) % 100}" if month in ["march"] else f"FY{year % 100 + 1}"
+#         # ---------------------------------------
+#         # 1️⃣ TOTAL ASSETS (always direct)
+#         # ---------------------------------------
+#         total_assets = match_contains(
+#             bs,
+#             ["totalassets"],
+#             exclude=["liabilitiesandequity", "assetsliabilities"]
+#         )
 
-# #     quarter = {
-# #         "june": "Q1",
-# #         "september": "Q2",
-# #         "december": "Q3",
-# #         "march": "Q4"
-# #     }.get(month, "")
-# #     return f"{quarter} {fy}"
+#         # ---------------------------------------
+#         # 2️⃣ TOTAL EQUITY
+#         # ---------------------------------------
+#         total_equity = match_exact_label(bs, ["totalequity"])
 
-# # def _extract_meta(text: str, unit_label: str = "units") -> Dict[str, Any]:
-# #     company = None
+#         if not total_equity:
+#             # Equity attributable to owners + NCI
+#             eq_attr = match_contains(bs, ["equityattributable"])
+#             nci = match_contains(bs, ["noncontrollinginterest", "n on-controllinginterest"])
+#             if eq_attr is not None:
+#                 total_equity = eq_attr + (nci or 0)
 
-# #     # 1️⃣ Find all possible "<Company> Limited"/"Ltd." occurrences
-# #     candidates = re.findall(
-# #         r'\b([A-Z][A-Za-z&\.\s]+?(?:LIMITED|LTD\.))\b',
-# #         text,
-# #         flags=re.IGNORECASE
-# #     )
+#         # ---------------------------------------
+#         # 3️⃣ TOTAL LIABILITIES
+#         # ---------------------------------------
+#         total_liabilities = match_exact_label(bs, ["totalliabilities", "total liabilities"])
 
-# #     # 2️⃣ Filter out known false positives (exchange names, regulators, etc.)
-# #     blacklist = re.compile(r'\b(BSE|NSE|Exchange|Societe|Luxembourg|SEBI|Board|Phiroze|Stock)\b', re.IGNORECASE)
-# #     filtered_candidates = [c.strip() for c in candidates if not blacklist.search(c)]
+#         if not total_liabilities:
+#             total_liabilities = match_contains(
+#                 bs,
+#                 ["totalliabilities", "totalliability", "totalliabilitie"],
+#                 exclude=["equity", "assets"]  # prevent picking "total equity and liabilities"
+#             )
 
-# #     # 3️⃣ If multiple matches, choose the most frequent or longest (often the real company)
-# #     if filtered_candidates:
-# #         company = max(filtered_candidates, key=len)
+#         if not total_liabilities:
+#             # Find "Total current liabilities"
+#             tcl = match_contains(
+#                 bs,
+#                 ["totalcurrentliabilities", "total current liabilities"]
+#             )
 
-# #     # 4️⃣ If still not found, look for “For <Company> Limited” or “Regd. Office - <Company>”
-# #     if not company:
-# #         fallback = re.search(
-# #             r'(?:For\s+)?([A-Z][A-Za-z\s&\.]+)\s+(?:Ltd\.?|LIMITED)',
-# #             text,
-# #             flags=re.IGNORECASE
-# #         )
-# #         if fallback:
-# #             company = fallback.group(1).strip() + " Limited"
+#             # Find "Total non-current liabilities"
+#             tncl = match_contains(
+#                 bs,
+#                 ["totalnoncurrentliabilities", "total non-current liabilities"]
+#             )
 
-# #     if not company:
-# #         reg_match = re.search(r'([A-Z][A-Za-z&\.\s]+)\s*(?=Regd\. Office)', text, flags=re.IGNORECASE)
-# #         if reg_match:
-# #             company = reg_match.group(1).strip()
+#             if isinstance(tcl, (int, float)) and isinstance(tncl, (int, float)):
+#                 total_liabilities = tcl + tncl
+#             else:
+#                 total_liabilities = None   # Avoid wrong numbers
 
-# #     # 5️⃣ Extract period if present
-# #     period = None
-# #     period_match = re.search(
-# #         r"(?:as at|as on|quarter ended|half year ended|year ended)\s+([A-Za-z0-9 ,\-]+[0-9]{4})",
-# #         text,
-# #         flags=re.IGNORECASE
-# #     )
-# #     if period_match:
-# #         period = period_match.group(1).strip()
+#         # ---------------------------------------
+#         # 4️⃣ PNL KPIs
+#         # ---------------------------------------
+#         revenue = match_contains(pnl, ["totalincome", "totalrevenue", "revenue"])
+#         net_profit = match_contains(pnl, ["profitfortheperiod", "profit"])
 
-# #     # 6️⃣ Return safely structured metadata
-# #     meta = {"company": company or "Unknown", "unit": unit_label}
-# #     if period:
-# #         meta["period_hint"] = _detect_period_hint(text)
+#         # ---------------------------------------
+#         # 5️⃣ CASH FLOW KPIs
+#         # ---------------------------------------
+#         operating_cash_flow = match_contains(cf, ["operatingactivities", "netcashfromoperating"])
+#         net_cash_flow = match_contains(cf, ["net(decrease)/increaseincash", "netcash"])
 
-# #     return meta
+#         # ---------------------------------------
+#         # 6️⃣ RATIO CALCULATION
+#         # ---------------------------------------
+#         ratios = {}
 
+#         if total_equity and total_liabilities:
+#             ratios["debt_equity_ratio"] = total_liabilities / total_equity
 
-# # def _extract_table_like_section(section_text: str, scale: float) -> List[Dict[str, Any]]:
-# #     items = []
-# #     if not section_text:
-# #         return items
+#         if total_assets and total_equity:
+#             ratios["equity_ratio"] = total_equity / total_assets
 
-# #     raw_lines = re.split(r'[\n\r]+', section_text)
-# #     candidate_frags = []
+#         if revenue and net_profit:
+#             ratios["net_profit_margin"] = net_profit / revenue
 
-# #     for line in raw_lines:
-# #         line = line.strip()
-# #         if not line:
-# #             continue
-# #         # break overly long lines using common punctuation heuristics
-# #         if len(line) > 500:
-# #             frags = re.split(r'[;\.\:\-]{1,}\s+', line)
-# #             candidate_frags.extend([f.strip() for f in frags if len(f.strip()) > 5])
-# #             continue
-# #         candidate_frags.append(line)
+#         if net_profit and total_equity:
+#             ratios["roe"] = net_profit / total_equity
 
-# #     for line in candidate_frags:
-# #         # find numeric tokens anywhere
-# #         if re.search(r'(DIN|Partner|Director|Chartered Accountants|Mumbai|LLP|CFO|Secretary)', line, re.IGNORECASE):
-# #             continue
-# #         nums = re.findall(r'\(?[0-9][0-9,\.()]*\)?', line)
-# #         if not nums:
-# #             continue
+#         if net_profit and total_assets:
+#             ratios["roa"] = net_profit / total_assets
 
-# #         # prefer numeric tokens at end of fragment
-# #         tail_match = re.search(r'(' + _NUM_TOKEN_RE + r'(?:\s+' + _NUM_TOKEN_RE + r')?)\s*$', line)
-# #         if tail_match:
-# #             vals = re.findall(r'\(?[0-9\.,]+\)?', tail_match.group(1))
-# #             name = line[:tail_match.start()].strip()
-# #         else:
-# #             vals = nums[:2]
-# #             name = re.sub(r'\(?[0-9][0-9,\.()]*\)?', '', line).strip()
+#         if net_profit and operating_cash_flow:
+#             ratios["cashflow_to_netincome"] = operating_cash_flow / net_profit
 
-# #         name = _normalize_item_name(name)
+#         # remove None
+#         clean = {
+#             k: v for k, v in {
+#                 "total_assets": total_assets,
+#                 "total_equity": total_equity,
+#                 "total_liabilities": total_liabilities,
+#                 "revenue": revenue,
+#                 "net_profit": net_profit,
+#                 "operating_cash_flow": operating_cash_flow,
+#                 "net_cash_flow": net_cash_flow,
+#                 "ratios": ratios
+#             }.items() if v is not None
+#         }
 
-# #         # handle glued comma-grouped numbers inside a single token
-# #         if len(vals) == 1:
-# #             glued = vals[0]
-# #             m_glued = re.search(
-# #                 r'([0-9]{1,3}(?:,[0-9]{2,3})+)([0-9]{1,3}(?:,[0-9]{2,3})+)$',
-# #                 glued
-# #             )
-# #             if m_glued:
-# #                 vals = [m_glued.group(1), m_glued.group(2)]
-
-# #         curr = parse_number(vals[0]) if len(vals) >= 1 else None
-# #         prev = parse_number(vals[1]) if len(vals) >= 2 else None
-
-# #         if curr is not None:
-# #             curr *= scale
-# #         if prev is not None:
-# #             prev *= scale
-
-# #         # filter noisy note headings etc.
-# #         if name.lower().startswith(("note", "annexure")):
-# #             continue
-# #         # skip tiny numeric tokens with no real label
-# #         if curr is not None and abs(curr) < 100 and len(name.split()) < 3:
-# #             continue
-
-# #         items.append({
-# #             "item": name,
-# #             "current_period": curr,
-# #             "previous_period": prev,
-# #             "confidence": "high" if curr is not None else "low"
-# #         })
-
-# #     return items
+#         return clean
 
 
-# # def _extract_simple_kv(section_text: str, scale: float) -> Dict[str, Any]:
-# #     out: Dict[str, Any] = {}
-# #     if not section_text:
-# #         return out
-# #     lines = re.split(r'[\n\r]+', section_text)
-# #     for raw in lines:
-# #         line = raw.strip()
-# #         if not line:
-# #             continue
-# #         # pattern: text <num> [<num>] at end of line
-# #         m = re.search(r'(.{3,200}?)\s+(' + _NUM_TOKEN_RE + r')(?:\s+(' + _NUM_TOKEN_RE + r'))?\s*$', line)
-# #         if not m:
-# #             continue
-# #         key = _normalize_item_name(m.group(1))
-# #         val1 = parse_number(m.group(2))
-# #         val2 = parse_number(m.group(3)) if m.group(3) else None
-# #         if val1 is not None:
-# #             val1 *= scale
-# #         if val2 is not None:
-# #             val2 *= scale
-# #         out[key] = {"value": val1, "previous": val2}
-# #     return out
+#     def parse(self, tables: List[Dict[str, Any]], pages_text: Dict[int, str]) -> Dict[str, Any]:
+#         """
+#         tables: List of { "page": int, "table": List[List] }
+#         pages_text: Dict[page_number -> text]
+#         returns: dict conforming to ExtractionOutput
+#         """
+#         out = {
+#             "balance_sheet": [],
+#             "pnl": [],
+#             "cash_flow": [],
+#             "flags": [],
+#         }
+
+#         if not tables:
+#             logger.warning("No tables provided to parser_service.parse")
+#         else:
+#             logger.info(
+#                 f"Parsing tables in range: pages {tables[0].get('page')} - {tables[-1].get('page')} , total tables: {len(tables)}"
+#             )
+
+#         for t in tables:
+#             page = t.get("page")
+#             raw = t.get("table", [])
+#             # try:
+#             #     kpis = extract_kpi_rows(raw, prefer_first_column_labels=self.prefer_first_column)
+#             # except Exception:
+#             #     logger.exception(f"Failed to extract KPI rows from table on page {page}")
+#             #     out["flags"].append({"page": page, "note": "kpi_extraction_failed"})
+#             #     continue
+#             page_text = pages_text.get(page, "") or ""
+#             section = self._guess_section(page_text)
+#             try:
+
+#                 # Force the first column to be label for cash flow tables
+#                 if section == "cash_flow":
+#                     kpis = extract_kpi_rows(
+#                         raw,
+#                         prefer_first_column_labels=True,
+#                         force_label_column=True   # NEW FLAG
+#                     )
+#                 else:
+#                     kpis = extract_kpi_rows(
+#                         raw,
+#                         prefer_first_column_labels=self.prefer_first_column
+#                     )
+
+#             except Exception:
+#                 logger.exception(f"Failed to extract KPI rows from table on page {page}")
+#                 out["flags"].append({"page": page, "note": "kpi_extraction_failed"})
+#                 continue
+#             #till here
+
+#             logger.debug(f"Table on page {page} guessed as section {section}; extracted {len(kpis)} rows")
+
+
+#             if section == "balance_sheet":
+#                 out["balance_sheet"].extend(kpis)
+#             elif section == "pnl":
+#                 out["pnl"].extend(kpis)
+#             elif section == "cash_flow":
+#                 out["cash_flow"].extend(kpis)
+#             else:
+#                 # attempt simple fallback: recognize words inside table labels
+#                 labelled = any((row.get("label") for row in kpis))
+#                 if labelled:
+#                     # try to detect using label keywords inside labels
+#                     placed = False
+#                     for row in kpis:
+#                         lbl = (row.get("label") or "").lower()
+#                         if any(x in lbl for x in ["assets", "liabilities", "equity", "shareholders"]):
+#                             out["balance_sheet"].append(row)
+#                             placed = True
+#                         elif any(x in lbl for x in ["revenue", "profit", "loss", "income", "turnover"]):
+#                             out["pnl"].append(row)
+#                             placed = True
+#                         elif any(x in lbl for x in ["cash", "operating activities", "investing activities", "financing activities"]):
+#                             out["cash_flow"].append(row)
+#                             placed = True
+#                         else:
+#                             continue
+#                     if not placed:
+#                         out["flags"].append({"page": page, "note": "unclassified_but_has_labels"})
+#                 else:
+#                     out["flags"].append({"page": page, "note": "unclassified_table_no_labels"})
+        
+#         important_kpis = self._compute_important_kpis(out)
+
+#         # convert to pydantic model for validation and normalization
+#         try:    
+#             final = ExtractionOutput(
+#                 balance_sheet=out["balance_sheet"],
+#                 pnl=out["pnl"],
+#                 cash_flow=out["cash_flow"],
+#                 flags=out["flags"],
+#                 important_kpis=important_kpis,
+#             )
+#             return final.dict()
+#         except Exception:
+#             logger.exception("Failed to validate final output against schema")
+#             # return raw out as fallback
+#             return out
+
+#     @staticmethod
+#     def _guess_section(page_text: str) -> str:
+#         """
+#         Detect section type using ALL common variants seen in DRHP/RHP/AR.
+#         """
+#         if not page_text:
+#             return "unknown"
+
+#         t = page_text.lower()
+
+#         # BALANCE SHEET keywords
+#         bs_keywords = [
+#             "balance sheet",
+#             "statement of financial position",
+#             "statement of assets and liabilities",
+#             "assets and liabilities",
+#             "summary of assets and liabilities",
+#             "restated consolidated balance sheet",
+#             "restated statement of assets",
+#             "summary restated balance sheet",
+#             "summary restated statement of assets",
+#             "summary of restated balance sheet",
+#             "summary of restated consolidated assets",
+#             "summary of restated consolidated balance sheet",
+#             "summary of balance sheet",
+#             "summary balance sheet",
+#             "assets & liabilities",
+#             "assets and liability",
+#             "restated financial position",
+#             "restated consolidated statement of assets and liabilities"
+#         ]
+
+#         # PROFIT & LOSS keywords
+#         pnl_keywords = [
+#             "profit and loss",
+#             "profit & loss",
+#             "p&l",
+#             "statement of profit",
+#             "statement of profit and loss",
+#             "consolidated p&l",
+#             "summary restated profit",
+#             "summary of profit and loss",
+#             "summary profit and loss",
+#             "restated consolidated profit",
+#             "income statement",
+#             "statement of income",
+#             "total income",
+#             "other comprehensive income",
+#             "oci",
+#             "restated consolidated statement of profit and loss"
+#         ]
+
+#         # CASH FLOW keywords
+#         cf_keywords = [
+#             "cash flow",
+#             "cashflow",
+#             "cash flows",
+#             "statement of cash flows",
+#             "summary cash flow",
+#             "summary of cash flows",
+#             "restated cash flows",
+#             "restated consolidated cash flow",
+#             "summary restated cash flows",
+#             "summary restated consolidated cash flows",
+#             "cash flow statement",
+#             "cash flows statement",
+#             "restated consolidated statement of cash flows",
+#             "restated consolidated statement of cashflows"
+#         ]
+
+#         if any(k in t for k in bs_keywords):
+#             return "balance_sheet"
+
+#         if any(k in t for k in pnl_keywords):
+#             return "pnl"
+
+#         if any(k in t for k in cf_keywords):
+#             return "cash_flow"
+
+#         return "unknown"
+
+
+
+
+
+# #correct
+# """
+# Parser orchestration: converts OCR outputs (pages_text + tables) into final JSON.
+
+# Strategy summary:
+# - For each table, attempt KPI extraction using table_extractor.extract_kpi_rows(...)
+# - Classify the table into balance_sheet / pnl / cash_flow using page text heuristics (keywords)
+# - Append extracted KPI rows to the matching section
+# - Provide flags for unclassified or suspicious tables
+
+# Usage:
+#     parser = ParserService(prefer_first_column_labels=True)
+#     result_dict = parser.parse(tables, pages_text)
+# """
+# import logging
+# from typing import List, Dict, Any
+# from app.services.table_extractor import extract_kpi_rows
+# from app.schemas.output_schema import ExtractionOutput
+
+# logger = logging.getLogger("app.services.parser_service")
+
+
+# class ParserServiceError(Exception):
+#     pass
+
+
+# class ParserService:
+#     def __init__(self, prefer_first_column_labels: bool = True):
+#         self.prefer_first_column = bool(prefer_first_column_labels)
+    
+#     def _compute_important_kpis(self, parsed):
+#         bs = parsed.get("balance_sheet", []) or []
+#         pnl = parsed.get("pnl", []) or []
+#         cf = parsed.get("cash_flow", []) or []
+
+#         def norm(s):
+#             if not s:
+#                 return ""
+#             return (
+#                 s.lower()
+#                 .replace(" ", "")
+#                 .replace("\u00a0", "")
+#                 .replace("\u2009", "")
+#                 .replace(".", "")
+#                 .replace(":", "")
+#             )
+
+#         def is_number(x):
+#             return isinstance(x, (int, float))
+
+
+#         def extract_latest_single_value(row):
+#             """Return value from FIRST numeric column (latest: June 30, 2025)."""
+#             vals = row.get("values", {}) or {}
+#             for k in sorted(vals.keys()):
+#                 try:
+#                     num = float(str(vals[k]).replace(",", ""))
+#                     return num
+#                 except:
+#                     continue
+#             return None
+
+#         # -------------------------
+#         # Extract last-3-values (handles 4-col, 5-col and fallbacks)
+#         # -------------------------
+#         def extract_period_values(row):
+#             vals = row.get("values", {}) or {}
+
+#             # normalize numeric strings -> float
+#             clean_vals = {}
+#             for k,v in vals.items():
+#                 try:
+#                     clean_vals[k] = float(str(v).replace(",", ""))
+#                 except:
+#                     clean_vals[k] = None
+
+#             keys = sorted(clean_vals.keys())
+
+#             # 5 column pattern
+#             if "col_5" in clean_vals:
+#                 mapping = {
+#                     "2025": clean_vals.get("col_3"),
+#                     "2024": clean_vals.get("col_4"),
+#                     "2023": clean_vals.get("col_5"),
+#                 }
+#             # 4 column pattern
+#             elif "col_4" in clean_vals:
+#                 mapping = {
+#                     "2025": clean_vals.get("col_2"),
+#                     "2024": clean_vals.get("col_3"),
+#                     "2023": clean_vals.get("col_4"),
+#                 }
+#             else:
+#                 # fallback: last 3 numeric columns
+#                 numeric = [k for k in keys if clean_vals.get(k) is not None]
+#                 if len(numeric) >= 3:
+#                     last3 = numeric[-3:]
+#                     mapping = {
+#                         "2025": clean_vals[last3[-1]],
+#                         "2024": clean_vals[last3[-2]],
+#                         "2023": clean_vals[last3[-3]],
+#                     }
+#                 else:
+#                     mapping = {}
+
+#             latest = mapping.get("2025")
+
+#             return latest, {
+#                 "latest": mapping.get("2025"),
+#                 "prev1": mapping.get("2024"),
+#                 "prev2": mapping.get("2023"),
+#             }
+
+
+#         # -------------------------
+#         # Row match helpers
+#         # -------------------------
+#         def match_row(rows, keywords, exclude=None, must_exact=False):
+#             # prefer exact equality for exact keywords, else contains
+#             for row in rows:
+#                 lbl = norm(row.get("label") or "")
+#                 if exclude and any(e in lbl for e in exclude):
+#                     continue
+#                 if must_exact:
+#                     if any(k == lbl for k in keywords):
+#                         return row
+#                 else:
+#                     if any(k in lbl for k in keywords):
+#                         return row
+#             return None
+
+#         # -------------------------
+#         # Collect KPIs (latest + periods)
+#         # -------------------------
+#         kpi = {}
+
+#         def assign_kpi(name, row):
+#             if not row:
+#                 return
+#             single_latest = extract_latest_single_value(row)   # <— correct latest value
+
+#             _, periods = extract_period_values(row)            # <— for charts (unchanged)
+
+#             if is_number(single_latest):
+#                 kpi[name] = single_latest                      # <— FIRST COLUMN!
+#                 kpi[f"{name}_periods"] = periods
+
+#         # TOTAL ASSETS - avoid picking "total liabilities and equity" etc.
+#         assign_kpi(
+#             "total_assets",
+#             match_row(bs, ["totalassets", "totalassetsandliabilities", "totalasset"], exclude=["liabilitiesandequity", "assetsliabilities"])
+#         )
+
+#         # TOTAL EQUITY - try exact first, else equity attributable + NCI fallback later
+#         equity_row = match_row(bs, ["totalequity", "shareholdersfunds"], must_exact=False)
+#         assign_kpi("total_equity", equity_row)
+
+#         # TOTAL LIABILITIES - try exact; if missing, try total current + total non-current
+#         liabilities_row = match_row(bs, ["totalliabilities", "totalliabilities", "totalliability", "totalliabilitie"], must_exact=False)
+#         if liabilities_row:
+#             assign_kpi("total_liabilities", liabilities_row)
+#         else:
+#             # try total current + total non-current
+#             tcl_row = match_row(bs, ["totalcurrentliabilities", "total current liabilities", "currentliabilities"])
+#             tncl_row = match_row(bs, ["totalnoncurrentliabilities", "total non-current liabilities", "noncurrentliabilities"])
+#             # extract numeric latests
+#             _, tcl_periods = extract_period_values(tcl_row) if tcl_row else (None, {})
+#             _, tncl_periods = extract_period_values(tncl_row) if tncl_row else (None, {})
+#             tcl_latest = tcl_periods.get("latest") if tcl_periods else None
+#             tncl_latest = tncl_periods.get("latest") if tncl_periods else None
+
+#             if is_number(tcl_latest) and is_number(tncl_latest):
+#                 total_liab_latest = tcl_latest + tncl_latest
+#                 kpi["total_liabilities"] = total_liab_latest
+#                 # for periods combine when both exist
+#                 kpi["total_liabilities_periods"] = {
+#                     "latest": total_liab_latest,
+#                     "prev1": (tcl_periods.get("prev1") or 0) + (tncl_periods.get("prev1") or 0) if (tcl_periods or tncl_periods) else None,
+#                     "prev2": (tcl_periods.get("prev2") or 0) + (tncl_periods.get("prev2") or 0) if (tcl_periods or tncl_periods) else None,
+#                 }
+
+#         # REVENUE (P&L)
+#         assign_kpi("revenue", match_row(pnl, ["totalincome", "totalrevenue", "revenue", "sales"]))
+
+#         # NET PROFIT (P&L)
+#         assign_kpi("net_profit", match_row(pnl, ["profitfortheperiod", "profitaftertax", "profit", "netprofit", "profitfortheyear"]))
+
+#         # NET CASH FLOW (cash flow)
+#         assign_kpi("net_cash_flow", match_row(cf, ["netcash", "net(decrease)/increaseincash", "netcashfromoperating", "netcashflow"]))
+
+#         # If total_equity not found directly, try equity attributable + non-controlling interest
+#         if "total_equity" not in kpi:
+#             eq_attr_row = match_row(bs, ["equityattributable", "equityattributabletoowners", "equityattributabletoownersofparent"])
+#             nci_row = match_row(bs, ["noncontrollinginterest", "non-controllinginterest", "n on-controllinginterest"])
+#             eq_attr_latest = None
+#             nci_latest = None
+#             eq_attr_periods = {}
+#             nci_periods = {}
+#             if eq_attr_row:
+#                 _, eq_attr_periods = extract_period_values(eq_attr_row)
+#                 eq_attr_latest = eq_attr_periods.get("latest")
+#             if nci_row:
+#                 _, nci_periods = extract_period_values(nci_row)
+#                 nci_latest = nci_periods.get("latest")
+#             if is_number(eq_attr_latest):
+#                 total_equity_val = eq_attr_latest + (nci_latest or 0)
+#                 kpi["total_equity"] = total_equity_val
+#                 kpi["total_equity_periods"] = {
+#                     "latest": total_equity_val,
+#                     "prev1": (eq_attr_periods.get("prev1") or 0) + (nci_periods.get("prev1") or 0),
+#                     "prev2": (eq_attr_periods.get("prev2") or 0) + (nci_periods.get("prev2") or 0),
+#                 }
+
+#         # ---------------------------------------
+#         # RATIOS (use latest values only - safe checks)
+#         # ---------------------------------------
+#         ratios = {}
+#         ta = kpi.get("total_assets")
+#         te = kpi.get("total_equity")
+#         tl = kpi.get("total_liabilities")
+#         rev = kpi.get("revenue")
+#         npv = kpi.get("net_profit")
+#         cf_latest = kpi.get("net_cash_flow")
+
+#         # make sure denominators are valid (non-zero)
+#         if is_number(te) and is_number(tl) and te != 0:
+#             ratios["debt_equity_ratio"] = tl / te
+
+#         if is_number(ta) and is_number(te) and ta != 0:
+#             ratios["equity_ratio"] = te / ta
+
+#         if is_number(rev) and is_number(npv) and rev != 0:
+#             ratios["net_profit_margin"] = npv / rev
+
+#         if is_number(npv) and is_number(te) and te != 0:
+#             ratios["roe"] = npv / te
+
+#         if is_number(npv) and is_number(ta) and ta != 0:
+#             ratios["roa"] = npv / ta
+
+#         if is_number(npv) and is_number(cf_latest) and npv != 0:
+#             ratios["cashflow_to_netincome"] = cf_latest / npv
+
+#         # attach ratios
+#         if ratios:
+#             kpi["ratios"] = ratios
+
+#         return kpi
+
+
+
+
+#     def parse(self, tables: List[Dict[str, Any]], pages_text: Dict[int, str]) -> Dict[str, Any]:
+#         """
+#         tables: List of { "page": int, "table": List[List] }
+#         pages_text: Dict[page_number -> text]
+#         returns: dict conforming to ExtractionOutput
+#         """
+#         out = {
+#             "balance_sheet": [],
+#             "pnl": [],
+#             "cash_flow": [],
+#             "flags": [],
+#         }
+
+#         if not tables:
+#             logger.warning("No tables provided to parser_service.parse")
+#         else:
+#             logger.info(
+#                 f"Parsing tables in range: pages {tables[0].get('page')} - {tables[-1].get('page')} , total tables: {len(tables)}"
+#             )
+
+#         for t in tables:
+#             page = t.get("page")
+#             raw = t.get("table", [])
+#             # try:
+#             #     kpis = extract_kpi_rows(raw, prefer_first_column_labels=self.prefer_first_column)
+#             # except Exception:
+#             #     logger.exception(f"Failed to extract KPI rows from table on page {page}")
+#             #     out["flags"].append({"page": page, "note": "kpi_extraction_failed"})
+#             #     continue
+#             page_text = pages_text.get(page, "") or ""
+#             section = self._guess_section(page_text)
+#             try:
+
+#                 # Force the first column to be label for cash flow tables
+#                 if section == "cash_flow":
+#                     kpis = extract_kpi_rows(
+#                         raw,
+#                         prefer_first_column_labels=True,
+#                         force_label_column=True   # NEW FLAG
+#                     )
+#                 else:
+#                     kpis = extract_kpi_rows(
+#                         raw,
+#                         prefer_first_column_labels=self.prefer_first_column
+#                     )
+
+#             except Exception:
+#                 logger.exception(f"Failed to extract KPI rows from table on page {page}")
+#                 out["flags"].append({"page": page, "note": "kpi_extraction_failed"})
+#                 continue
+#             #till here
+
+#             logger.debug(f"Table on page {page} guessed as section {section}; extracted {len(kpis)} rows")
+
+
+#             if section == "balance_sheet":
+#                 out["balance_sheet"].extend(kpis)
+#             elif section == "pnl":
+#                 out["pnl"].extend(kpis)
+#             elif section == "cash_flow":
+#                 out["cash_flow"].extend(kpis)
+#             else:
+#                 # attempt simple fallback: recognize words inside table labels
+#                 labelled = any((row.get("label") for row in kpis))
+#                 if labelled:
+#                     # try to detect using label keywords inside labels
+#                     placed = False
+#                     for row in kpis:
+#                         lbl = (row.get("label") or "").lower()
+#                         if any(x in lbl for x in ["assets", "liabilities", "equity", "shareholders"]):
+#                             out["balance_sheet"].append(row)
+#                             placed = True
+#                         elif any(x in lbl for x in ["revenue", "profit", "loss", "income", "turnover"]):
+#                             out["pnl"].append(row)
+#                             placed = True
+#                         elif any(x in lbl for x in ["cash", "operating activities", "investing activities", "financing activities"]):
+#                             out["cash_flow"].append(row)
+#                             placed = True
+#                         else:
+#                             continue
+#                     if not placed:
+#                         out["flags"].append({"page": page, "note": "unclassified_but_has_labels"})
+#                 else:
+#                     out["flags"].append({"page": page, "note": "unclassified_table_no_labels"})
+        
+#         important_kpis = self._compute_important_kpis(out)
+
+#         # convert to pydantic model for validation and normalization
+#         try:    
+#             final = ExtractionOutput(
+#                 balance_sheet=out["balance_sheet"],
+#                 pnl=out["pnl"],
+#                 cash_flow=out["cash_flow"],
+#                 flags=out["flags"],
+#                 important_kpis=important_kpis,
+#             )
+#             return final.dict()
+#         except Exception:
+#             logger.exception("Failed to validate final output against schema")
+#             # return raw out as fallback
+#             return out
+
+#     @staticmethod
+#     def _guess_section(page_text: str) -> str:
+#         """
+#         Detect section type using ALL common variants seen in DRHP/RHP/AR.
+#         """
+#         if not page_text:
+#             return "unknown"
+
+#         t = page_text.lower()
+
+#         # BALANCE SHEET keywords
+#         bs_keywords = [
+#             "balance sheet",
+#             "statement of financial position",
+#             "statement of assets and liabilities",
+#             "assets and liabilities",
+#             "summary of assets and liabilities",
+#             "restated consolidated balance sheet",
+#             "restated statement of assets",
+#             "summary restated balance sheet",
+#             "summary restated statement of assets",
+#             "summary of restated balance sheet",
+#             "summary of restated consolidated assets",
+#             "summary of restated consolidated balance sheet",
+#             "summary of balance sheet",
+#             "summary balance sheet",
+#             "assets & liabilities",
+#             "assets and liability",
+#             "restated financial position",
+#             "restated consolidated statement of assets and liabilities"
+#         ]
+
+#         # PROFIT & LOSS keywords
+#         pnl_keywords = [
+#             "profit and loss",
+#             "profit & loss",
+#             "p&l",
+#             "statement of profit",
+#             "statement of profit and loss",
+#             "consolidated p&l",
+#             "summary restated profit",
+#             "summary of profit and loss",
+#             "summary profit and loss",
+#             "restated consolidated profit",
+#             "income statement",
+#             "statement of income",
+#             "total income",
+#             "other comprehensive income",
+#             "oci",
+#             "restated consolidated statement of profit and loss"
+#         ]
+
+#         # CASH FLOW keywords
+#         cf_keywords = [
+#             "cash flow",
+#             "cashflow",
+#             "cash flows",
+#             "statement of cash flows",
+#             "summary cash flow",
+#             "summary of cash flows",
+#             "restated cash flows",
+#             "restated consolidated cash flow",
+#             "summary restated cash flows",
+#             "summary restated consolidated cash flows",
+#             "cash flow statement",
+#             "cash flows statement",
+#             "restated consolidated statement of cash flows",
+#             "restated consolidated statement of cashflows"
+#         ]
+
+#         if any(k in t for k in bs_keywords):
+#             return "balance_sheet"
+
+#         if any(k in t for k in pnl_keywords):
+#             return "pnl"
+
+#         if any(k in t for k in cf_keywords):
+#             return "cash_flow"
+
+#         return "unknown"
+
+
+
+
+
+"""
+Parser orchestration: converts OCR outputs (pages_text + tables) into final JSON.
+
+Strategy summary:
+- For each table, attempt KPI extraction using table_extractor.extract_kpi_rows(...)
+- Classify the table into balance_sheet / pnl / cash_flow using page text heuristics (keywords)
+- Append extracted KPI rows to the matching section
+- Provide flags for unclassified or suspicious tables
+
+Usage:
+    parser = ParserService(prefer_first_column_labels=True)
+    result_dict = parser.parse(tables, pages_text)
+"""
+import logging
+from typing import List, Dict, Any
+from app.services.table_extractor import extract_kpi_rows
+from app.schemas.output_schema import ExtractionOutput
+
+logger = logging.getLogger("app.services.parser_service")
+
+
+class ParserServiceError(Exception):
+    pass
+
+
+class ParserService:
+    def __init__(self, prefer_first_column_labels: bool = True):
+        self.prefer_first_column = bool(prefer_first_column_labels)
+    
+    def _compute_important_kpis(self, parsed):
+        bs = parsed.get("balance_sheet", []) or []
+        pnl = parsed.get("pnl", []) or []
+        cf = parsed.get("cash_flow", []) or []
+
+        def norm(s):
+            if not s:
+                return ""
+            return (
+                s.lower()
+                .replace(" ", "")
+                .replace("\u00a0", "")
+                .replace("\u2009", "")
+                .replace(".", "")
+                .replace(":", "")
+            )
+
+        def is_number(x):
+            return isinstance(x, (int, float))
+
+
+        def extract_latest_single_value(row):
+            """Return value from FIRST numeric column (latest: June 30, 2025)."""
+            vals = row.get("values", {}) or {}
+            for k in sorted(vals.keys()):
+                try:
+                    num = float(str(vals[k]).replace(",", ""))
+                    return num
+                except:
+                    continue
+            return None
+
+        # -------------------------
+        # Extract last-3-values (handles 4-col, 5-col and fallbacks)
+        # -------------------------
+        def extract_period_values(row):
+            vals = row.get("values", {}) or {}
+
+            # normalize numeric strings -> float
+            clean_vals = {}
+            for k,v in vals.items():
+                try:
+                    clean_vals[k] = float(str(v).replace(",", ""))
+                except:
+                    clean_vals[k] = None
+
+            keys = sorted(clean_vals.keys())
+
+            # 5 column pattern
+            if "col_5" in clean_vals:
+                mapping = {
+                    "2025": clean_vals.get("col_3"),
+                    "2024": clean_vals.get("col_4"),
+                    "2023": clean_vals.get("col_5"),
+                }
+            # 4 column pattern
+            elif "col_4" in clean_vals:
+                mapping = {
+                    "2025": clean_vals.get("col_2"),
+                    "2024": clean_vals.get("col_3"),
+                    "2023": clean_vals.get("col_4"),
+                }
+            else:
+                # fallback: last 3 numeric columns
+                numeric = [k for k in keys if clean_vals.get(k) is not None]
+                if len(numeric) >= 3:
+                    last3 = numeric[-3:]
+                    mapping = {
+                        "2025": clean_vals[last3[-1]],
+                        "2024": clean_vals[last3[-2]],
+                        "2023": clean_vals[last3[-3]],
+                    }
+                else:
+                    mapping = {}
+
+            latest = mapping.get("2025")
+
+            return latest, {
+                "latest": mapping.get("2025"),
+                "prev1": mapping.get("2024"),
+                "prev2": mapping.get("2023"),
+            }
+
+
+        # -------------------------
+        # Row match helpers
+        # -------------------------
+        # ---------------------------------------
+        # MATCH HELPERS (old logic behavior)
+        # ---------------------------------------
+        def match_exact_label(rows, keywords):
+            for row in rows:
+                lbl = norm(row.get("label"))
+                if any(k == lbl for k in keywords):
+                    return row
+            return None
+
+        def match_contains(rows, keywords, exclude=None):
+            for row in rows:
+                lbl = norm(row.get("label"))
+                if exclude and any(e in lbl for e in exclude):
+                    continue
+                if any(k in lbl for k in keywords):
+                    return row
+            return None
+        # -------------------------
+        # Collect KPIs (latest + periods)
+        # -------------------------
+        kpi = {}
+
+        def assign_kpi(name, row):
+            if not row:
+                return
+            single_latest = extract_latest_single_value(row)   # <— correct latest value
+
+            _, periods = extract_period_values(row)            # <— for charts (unchanged)
+
+            if is_number(single_latest):
+                kpi[name] = single_latest                      # <— FIRST COLUMN!
+                kpi[f"{name}_periods"] = periods
+
+        # ---------------------------------------
+        # 1️⃣ TOTAL ASSETS
+        # ---------------------------------------
+        assets_row = match_contains(
+            bs,
+            ["totalassets"],
+            exclude=["liabilitiesandequity", "assetsliabilities"]
+        )
+        assign_kpi("total_assets", assets_row)
+
+        # ---------------------------------------
+        # 2️⃣ TOTAL EQUITY
+        # ---------------------------------------
+        equity_row = match_exact_label(bs, ["totalequity"])
+        assign_kpi("total_equity", equity_row)
+
+        # fallback: equity attributable + NCI
+        if "total_equity" not in kpi:
+            eq_attr = match_contains(bs, ["equityattributable"])
+            nci = match_contains(bs, ["noncontrollinginterest", "n on-controllinginterest"])
+
+            if eq_attr:
+                eq_latest = extract_latest_single_value(eq_attr)
+                _, p1 = extract_period_values(eq_attr)
+
+                if nci:
+                    _, p2 = extract_period_values(nci)
+                    nci_latest = p2.get("latest")
+                else:
+                    nci_latest = 0
+                    p2 = {"prev1": 0, "prev2": 0}
+
+                total_equity_val = (eq_latest or 0) + (nci_latest or 0)
+                kpi["total_equity"] = total_equity_val
+                kpi["total_equity_periods"] = {
+                    "latest": total_equity_val,
+                    "prev1": (p1.get("prev1") or 0) + (p2.get("prev1") or 0),
+                    "prev2": (p1.get("prev2") or 0) + (p2.get("prev2") or 0),
+                }
+
+        # ---------------------------------------
+        # 3️⃣ TOTAL LIABILITIES
+        # ---------------------------------------
+        liab_row = match_exact_label(bs, ["totalliabilities", "total liabilities"])
+        if not liab_row:
+            liab_row = match_contains(
+                bs,
+                ["totalliabilities", "totalliability", "totalliabilitie"],
+                exclude=["equity", "assets"]
+            )
+
+        if liab_row:
+            assign_kpi("total_liabilities", liab_row)
+
+        else:
+            # fallback to current + non-current
+            tcl = match_contains(bs, ["totalcurrentliabilities", "total current liabilities"])
+            tncl = match_contains(bs, ["totalnoncurrentliabilities", "total non-current liabilities"])
+
+            tcl_latest, tcl_periods = extract_period_values(tcl) if tcl else (None, {})
+            tncl_latest, tncl_periods = extract_period_values(tncl) if tncl else (None, {})
+
+            if tcl_latest is not None and tncl_latest is not None:
+                total_latest = tcl_latest + tncl_latest
+                kpi["total_liabilities"] = total_latest
+                kpi["total_liabilities_periods"] = {
+                    "latest": total_latest,
+                    "prev1": (tcl_periods.get("prev1") or 0) + (tncl_periods.get("prev1") or 0),
+                    "prev2": (tcl_periods.get("prev2") or 0) + (tncl_periods.get("prev2") or 0),
+                }
+
+        # ---------------------------------------
+        # 4️⃣ PNL KPIs
+        # ---------------------------------------
+        rev_row = match_contains(pnl, ["totalincome", "totalrevenue", "revenue"])
+        assign_kpi("revenue", rev_row)
+
+        profit_row = match_contains(pnl, ["profitfortheperiod", "profit"])
+        assign_kpi("net_profit", profit_row)
+
+        # ---------------------------------------
+        # 5️⃣ CASH FLOW KPIs
+        # ---------------------------------------
+        ocf_row = match_contains(cf, ["operatingactivities", "netcashfromoperating"])
+        assign_kpi("operating_cash_flow", ocf_row)
+
+        ncf_row = match_contains(cf, [
+            "net(decrease)/increaseincash",
+            "netcash",
+            "netcashflow",
+            "netincreaseincash",
+            "netdecreaseincash",
+            "netcashfromoperating",
+        ])
+        assign_kpi("net_cash_flow", ncf_row)
+
+        # ---------------------------------------
+        # RATIOS (use latest values only - safe checks)
+        # ---------------------------------------
+        ratios = {}
+        ta = kpi.get("total_assets")
+        te = kpi.get("total_equity")
+        tl = kpi.get("total_liabilities")
+        rev = kpi.get("revenue")
+        npv = kpi.get("net_profit")
+        cf_latest = kpi.get("net_cash_flow")
+
+        # make sure denominators are valid (non-zero)
+        if is_number(te) and is_number(tl) and te != 0:
+            ratios["debt_equity_ratio"] = tl / te
+
+        if is_number(ta) and is_number(te) and ta != 0:
+            ratios["equity_ratio"] = te / ta
+
+        if is_number(rev) and is_number(npv) and rev != 0:
+            ratios["net_profit_margin"] = npv / rev
+
+        if is_number(npv) and is_number(te) and te != 0:
+            ratios["roe"] = npv / te
+
+        if is_number(npv) and is_number(ta) and ta != 0:
+            ratios["roa"] = npv / ta
+
+        if is_number(npv) and is_number(cf_latest) and npv != 0:
+            ratios["cashflow_to_netincome"] = cf_latest / npv
+
+        # attach ratios
+        if ratios:
+            kpi["ratios"] = ratios
+
+        return kpi
+
+
+
+
+    def parse(self, tables: List[Dict[str, Any]], pages_text: Dict[int, str]) -> Dict[str, Any]:
+        """
+        tables: List of { "page": int, "table": List[List] }
+        pages_text: Dict[page_number -> text]
+        returns: dict conforming to ExtractionOutput
+        """
+        out = {
+            "balance_sheet": [],
+            "pnl": [],
+            "cash_flow": [],
+            "flags": [],
+        }
+
+        if not tables:
+            logger.warning("No tables provided to parser_service.parse")
+        else:
+            logger.info(
+                f"Parsing tables in range: pages {tables[0].get('page')} - {tables[-1].get('page')} , total tables: {len(tables)}"
+            )
+
+        for t in tables:
+            page = t.get("page")
+            raw = t.get("table", [])
+            # try:
+            #     kpis = extract_kpi_rows(raw, prefer_first_column_labels=self.prefer_first_column)
+            # except Exception:
+            #     logger.exception(f"Failed to extract KPI rows from table on page {page}")
+            #     out["flags"].append({"page": page, "note": "kpi_extraction_failed"})
+            #     continue
+            page_text = pages_text.get(page, "") or ""
+            section = self._guess_section(page_text)
+            try:
+
+                # Force the first column to be label for cash flow tables
+                if section == "cash_flow":
+                    kpis = extract_kpi_rows(
+                        raw,
+                        prefer_first_column_labels=True,
+                        force_label_column=True   # NEW FLAG
+                    )
+                else:
+                    kpis = extract_kpi_rows(
+                        raw,
+                        prefer_first_column_labels=self.prefer_first_column
+                    )
+
+            except Exception:
+                logger.exception(f"Failed to extract KPI rows from table on page {page}")
+                out["flags"].append({"page": page, "note": "kpi_extraction_failed"})
+                continue
+            #till here
+
+            logger.debug(f"Table on page {page} guessed as section {section}; extracted {len(kpis)} rows")
+
+
+            if section == "balance_sheet":
+                out["balance_sheet"].extend(kpis)
+            elif section == "pnl":
+                out["pnl"].extend(kpis)
+            elif section == "cash_flow":
+                out["cash_flow"].extend(kpis)
+            else:
+                # attempt simple fallback: recognize words inside table labels
+                labelled = any((row.get("label") for row in kpis))
+                if labelled:
+                    # try to detect using label keywords inside labels
+                    placed = False
+                    for row in kpis:
+                        lbl = (row.get("label") or "").lower()
+                        if any(x in lbl for x in ["assets", "liabilities", "equity", "shareholders"]):
+                            out["balance_sheet"].append(row)
+                            placed = True
+                        elif any(x in lbl for x in ["revenue", "profit", "loss", "income", "turnover"]):
+                            out["pnl"].append(row)
+                            placed = True
+                        elif any(x in lbl for x in ["cash", "operating activities", "investing activities", "financing activities"]):
+                            out["cash_flow"].append(row)
+                            placed = True
+                        else:
+                            continue
+                    if not placed:
+                        out["flags"].append({"page": page, "note": "unclassified_but_has_labels"})
+                else:
+                    out["flags"].append({"page": page, "note": "unclassified_table_no_labels"})
+        
+        important_kpis = self._compute_important_kpis(out)
+
+        # convert to pydantic model for validation and normalization
+        try:    
+            final = ExtractionOutput(
+                balance_sheet=out["balance_sheet"],
+                pnl=out["pnl"],
+                cash_flow=out["cash_flow"],
+                flags=out["flags"],
+                important_kpis=important_kpis,
+            )
+            return final.dict()
+        except Exception:
+            logger.exception("Failed to validate final output against schema")
+            # return raw out as fallback
+            return out
+
+    @staticmethod
+    def _guess_section(page_text: str) -> str:
+        """
+        Detect section type using ALL common variants seen in DRHP/RHP/AR.
+        """
+        if not page_text:
+            return "unknown"
+
+        t = page_text.lower()
+
+        # BALANCE SHEET keywords
+        bs_keywords = [
+            "balance sheet",
+            "statement of financial position",
+            "statement of assets and liabilities",
+            "assets and liabilities",
+            "summary of assets and liabilities",
+            "restated consolidated balance sheet",
+            "restated statement of assets",
+            "restated statement of assets and liabilities",
+            "restated consolidated statement of assets and liabilities",
+            "restated consolidated statement of assets & liabilities",
+            "summary restated balance sheet",
+            "summary restated statement of assets",
+            "summary of restated balance sheet",
+            "summary of restated consolidated assets",
+            "summary of restated consolidated balance sheet",
+            "summary of balance sheet",
+            "summary balance sheet",
+            "summary restated consolidated balance sheet",
+            "assets & liabilities",
+            "assets and liability",
+            "restated financial position",
+            "restated consolidated statement of assets and liabilities",
+            "summary of restated assets and liabilities",
+            "summary restated assets and liabilities",
+        ]
+
+        # PROFIT & LOSS keywords
+        pnl_keywords = [
+            "profit and loss",
+            "profit & loss",
+            "p&l",
+            "statement of profit",
+            "statement of profit and loss",
+            "consolidated p&l",
+            "summary restated profit",
+            "summary of profit and loss",
+            "summary profit and loss",
+            "restated consolidated profit",
+            "income statement",
+            "statement of income",
+            "total income",
+            "other comprehensive income",
+            "oci",
+            "restated consolidated statement of profit and loss",
+            "summary restated profit and loss",
+            "summary of restated profit and loss",
+            "restated consolidated profit and loss",
+            "statement of profit & loss",
+            "restated statement of profit and loss",
+            "restated consolidated statement of profit and loss",
+            "restated consolidated statement of profit & loss",
+            "summary consolidated profit and loss",
+            "profit for the year",
+            "profit for the period",
+            "income statement",
+        ]
+
+        # CASH FLOW keywords
+        cf_keywords = [
+            "cash flow",
+            "cashflow",
+            "cash flows",
+            "cashflows",
+            "statement of cash flows",
+            "summary cash flow",
+            "summary of cash flows",
+            "restated cash flows",
+            "summary cash flows",
+            "restated consolidated cash flow",
+            "summary restated cash flows",
+            "summary restated consolidated cash flows",
+            "cash flow statement",
+            "cash flows statement",
+            "restated consolidated statement of cash flows",
+            "restated consolidated statement of cashflows",
+            "summary restated cash flows",
+            "summary of restated cash flows",
+            "restated consolidated cash flows",
+            "summary consolidated cash flows",
+            "net cash",
+        ]
+
+        if any(k in t for k in bs_keywords):
+            return "balance_sheet"
+
+        if any(k in t for k in pnl_keywords):
+            return "pnl"
+
+        if any(k in t for k in cf_keywords):
+            return "cash_flow"
+
+        return "unknown"
