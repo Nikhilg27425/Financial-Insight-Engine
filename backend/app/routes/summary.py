@@ -7,6 +7,7 @@ from pathlib import Path
 from app.services.toc_service import extract_toc_text, detect_mda_page_range
 from app.services.mda_extractor import extract_mda_text
 from app.services.summarizer import clean_text, textrank_summarize
+from app.utils.company_extract import extract_company_name
 
 router = APIRouter()
 
@@ -28,6 +29,8 @@ async def get_summary(file_id: str):
         if not matches:
             raise HTTPException(status_code=404, detail="File not found.")
         file_path = matches[0]
+
+    company = extract_company_name(file_path.name)
 
     # Step 1 — Extract TOC
     toc_text = extract_toc_text(str(file_path))
@@ -53,6 +56,7 @@ async def get_summary(file_id: str):
     return {
         "success": True,
         "file": file_id,
+        "company": company,
         "section": "Management Discussion & Analysis",
         "start_page": start_page,
         "end_page": end_page,

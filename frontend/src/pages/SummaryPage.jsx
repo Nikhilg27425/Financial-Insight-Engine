@@ -14,6 +14,9 @@ export default function SummaryPage() {
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState("");
 
+  const companyName = summary?.company || "Company";
+
+
   // Safe bulletify (never crashes)
   const bulletify = (text) => {
     if (!text || typeof text !== "string") return <li>No summary available.</li>;
@@ -42,24 +45,26 @@ export default function SummaryPage() {
     // ===== HEADER =====
     doc.setFont("helvetica", "bold");
     doc.setFontSize(20);
-    doc.text("Company Financial Summary", pageWidth / 2, y, { align: "center" });
+    doc.text(`${companyName} – Financial Summary Report`, pageWidth / 2, y, {
+      align: "center",
+    });
     y += 30;
 
     // Company
     doc.setFontSize(13);
     doc.setFont("helvetica", "normal");
-    if (summary.company) {
-      doc.text(`Company: ${summary.company}`, margin, y);
+    if (companyName) {
+      doc.text(`Company: ${companyName}`, margin, y);
       y += 20;
     }
 
-    // Pages scanned
-    doc.text(
-      `Pages Scanned: ${summary.start_page} → ${summary.end_page}`,
-      margin,
-      y
-    );
-    y += 20;
+    // // Pages scanned
+    // doc.text(
+    //   `Pages Scanned: ${summary.start_page} → ${summary.end_page}`,
+    //   margin,
+    //   y
+    // );
+    // y += 20;
 
     // Date
     doc.text(`Generated On: ${new Date().toLocaleString()}`, margin, y);
@@ -74,10 +79,25 @@ export default function SummaryPage() {
     doc.setFont("helvetica", "normal");
     doc.setFontSize(12);
 
-    const bulletLines = (summary.summary || "")
+    const cleanForPDF = (text) => {
+      if (!text) return "";
+      
+      return text
+        .replace(/\s+/g, " ")           
+        .replace(/[•●▪︎▶]/g, "")        
+        .replace(/[^\x00-\x7F]+/g, " ")
+        .replace(/(\.\s*\.)+/g, ".")
+        .trim();
+    };
+
+
+    const raw = cleanForPDF(summary.summary || "");
+
+    const bulletLines = raw
       .split(". ")
-      .filter((l) => l.trim().length > 0)
-      .map((l) => "• " + l.trim() + ".");
+      .map((line) => line.trim())
+      .filter((line) => line.length > 2)
+      .map((line) => "• " + line + ".");
 
     bulletLines.forEach((line) => {
       const wrapped = doc.splitTextToSize(line, pageWidth - margin * 2);
@@ -126,7 +146,7 @@ export default function SummaryPage() {
       summary.company?.replace(/[^a-zA-Z0-9]/g, "_") ||
       "Financial_Summary_Report";
 
-    doc.save(`${filename}_Summary.pdf`);
+    doc.save(`${companyName || "Company"}-Summary.pdf`);
   };
 
   // useEffect(() => {
@@ -229,7 +249,7 @@ export default function SummaryPage() {
     return (
       <div className="page">
         <div className="page-header">
-          <h2>Company Summary</h2>
+          <h2>Summary — {companyName}</h2>
           <p className="muted">Loading summary...</p>
         </div>
         <div className="card">
@@ -243,7 +263,7 @@ export default function SummaryPage() {
     return (
       <div className="page">
         <div className="page-header">
-          <h2>Company Summary</h2>
+          <h2>Summary — {companyName}</h2>
           <p className="muted text-red">{error || "No summary available."}</p>
         </div>
         <div className="card">
@@ -256,7 +276,7 @@ export default function SummaryPage() {
   return (
     <div className="page">
       <div className="page-header">
-        <h2>Company Summary</h2>
+        <h2>Summary — {companyName}</h2>
         <p className="muted">Generated using TextRank summarization.</p>
       </div>
 
