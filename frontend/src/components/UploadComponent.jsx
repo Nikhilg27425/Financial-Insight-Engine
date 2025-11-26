@@ -17,31 +17,42 @@ export default function UploadComponent() {
   const [error, setError] = useState(null);
   const [validationError, setValidationError] = useState(null);
   const [company, setCompany] = useState(() => localStorage.getItem(LAST_COMPANY_KEY));
-  const [importantKpis, setImportantKpis] = useState(() =>
-    JSON.parse(localStorage.getItem("LATEST_IMPORTANT_KPIS") || "{}")
-  );
+  const [importantKpis, setImportantKpis] = useState({});
   const [params] = useSearchParams();
   const fileIdFromURL = params.get("fileId");
 
-
-
-
-  // Load last upload result
+  // Clear stale data if coming fresh to upload page without any selected file
   useEffect(() => {
-    const lastResult = sessionStorage.getItem(LAST_UPLOAD_KEY);
-    if (lastResult) {
-      try {
-        const parsed = JSON.parse(lastResult);
-        setResult(parsed);
-        setUploadProgress("complete");
-        if (parsed?.upload?.company) {
-          setCompany(parsed.upload.company);
-        }
-      } catch (err) {
-        console.error("Failed to load last upload result:", err);
-      }
+    const lastId = sessionStorage.getItem("LATEST_UPLOAD_FILE_ID");
+
+    // If user opened upload page with NO fileId and NO cached upload, reset UI
+    if (!fileIdFromURL && !lastId) {
+      setResult(null);
+      setImportantKpis({});
+      setUploadProgress("idle");
     }
-  }, []);
+  }, [fileIdFromURL]);
+
+
+
+  // Load correct upload result when returning to upload page
+  useEffect(() => {
+    const fileId = fileIdFromURL || sessionStorage.getItem("LATEST_UPLOAD_FILE_ID");
+    if (!fileId) return;
+
+    const cached = sessionStorage.getItem(`upload_${fileId}`);
+    if (!cached) return;
+
+    try {
+      const parsed = JSON.parse(cached);
+      setResult(parsed);
+      setImportantKpis(parsed.analysis?.important_kpis || {});
+      setUploadProgress("complete");
+    } catch (err) {
+      console.error("Failed to parse cached upload result:", err);
+    }
+  }, [fileIdFromURL]);
+
 
 
   // helper to clear session caches (prefix match)
@@ -109,7 +120,7 @@ export default function UploadComponent() {
       setImportantKpis(analysisData.important_kpis || {}); //change
 
       // Save detected company
-      const detectedCompany = uploadData.company || company || null;
+      const detectedCompany = uploadData.company || null;
       if (detectedCompany) {
         setCompany(detectedCompany);
         localStorage.setItem(LAST_COMPANY_KEY, detectedCompany);
@@ -157,7 +168,8 @@ export default function UploadComponent() {
       // Clear previous session caches (force pages to re-fetch on first open for the new file)
       clearSessionCaches(/* keepForFileId = null */); // remove everything so fresh fetches happen
 
-      sessionStorage.setItem(LAST_UPLOAD_KEY, JSON.stringify(uploadResult));
+      sessionStorage.setItem(`upload_${uploadData.file_id}`, JSON.stringify(uploadResult));
+      sessionStorage.setItem("LATEST_UPLOAD_FILE_ID", uploadData.file_id);
 
       // Clear input
       
@@ -175,34 +187,34 @@ export default function UploadComponent() {
     }
   };
 
-  useEffect(() => {
-    async function loadExistingFile() {
-      if (!fileIdFromURL) return;
+  // useEffect(() => {
+  //   async function loadExistingFile() {
+  //     if (!fileIdFromURL) return;
 
-      setLoading(true);
-      setUploadProgress("analyzing");
+  //     setLoading(true);
+  //     setUploadProgress("analyzing");
 
-      try {
-        const analysisData = await api.analyzeFile(fileIdFromURL);
+  //     try {
+  //       const analysisData = await api.analyzeFile(fileIdFromURL);
 
-        setImportantKpis(analysisData.important_kpis || {});
-        setResult({ upload: { file_id: fileIdFromURL }, analysis: analysisData });
+  //       setImportantKpis(analysisData.important_kpis || {});
+  //       setResult({ upload: { file_id: fileIdFromURL }, analysis: analysisData });
 
-        // Save locally so dashboard/summary also work
-        localStorage.setItem("LATEST_FILE_ID", fileIdFromURL);
-        localStorage.setItem("LATEST_ANALYSIS_DATA", JSON.stringify(analysisData));
+  //       // Save locally so dashboard/summary also work
+  //       localStorage.setItem("LATEST_FILE_ID", fileIdFromURL);
+  //       localStorage.setItem("LATEST_ANALYSIS_DATA", JSON.stringify(analysisData));
 
-        setUploadProgress("complete");
-      } catch (err) {
-        console.error(err);
-        setError("Failed to load saved file analysis");
-      } finally {
-        setLoading(false);
-      }
-    }
+  //       setUploadProgress("complete");
+  //     } catch (err) {
+  //       console.error(err);
+  //       setError("Failed to load saved file analysis");
+  //     } finally {
+  //       setLoading(false);
+  //     }
+  //   }
 
-    loadExistingFile();
-  }, [fileIdFromURL]);
+  //   loadExistingFile();
+  // }, [fileIdFromURL]);
 
 
   const getProgressText = () => {
